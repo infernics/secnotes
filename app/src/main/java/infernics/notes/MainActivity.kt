@@ -330,6 +330,7 @@ private fun SecNoteApp(activity: MainActivity) {
                     biometricEnabled = biometricEnabled,
                     panicPasswordConfigured = panicPasswordConfigured,
                     hiddenVaultConfigured = hiddenVaultConfigured,
+                    lockCleanupPending = lockCleanupPending,
                     screenshotBlockingEnabled = screenshotBlockingEnabled,
                     autoLockMinutes = autoLockMinutes,
                     onLock = lockMainVault,
@@ -652,6 +653,7 @@ private fun MainScreen(
     biometricEnabled: Boolean,
     panicPasswordConfigured: Boolean,
     hiddenVaultConfigured: Boolean,
+    lockCleanupPending: Boolean,
     screenshotBlockingEnabled: Boolean,
     autoLockMinutes: Int,
     onLock: () -> Unit,
@@ -674,7 +676,10 @@ private fun MainScreen(
 
     // The additional store key is session-only and is destroyed whenever this area closes.
     DisposableEffect(hiddenCrypto) {
-        onDispose { hiddenCrypto?.destroy() }
+        // Capture the key belonging to this effect instance. Reading the mutable state
+        // during disposal could see the already-updated null value and skip destruction.
+        val sessionKey = hiddenCrypto
+        onDispose { sessionKey?.destroy() }
     }
 
     if (showHiddenUnlock) {
