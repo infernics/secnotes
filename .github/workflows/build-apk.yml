@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Test and build SecNote 1.4.10
+    name: Test and build SecNote 1.4.11
     runs-on: ubuntu-latest
 
     steps:
@@ -69,6 +69,7 @@ jobs:
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/CameraCaptureScreen.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/ThumbnailDecodePolicy.kt"
+          test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/AutoLockPolicy.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/PanicCredentialTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/NoteOrderingTest.kt"
@@ -76,6 +77,7 @@ jobs:
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/ThumbnailDecodePolicyTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/CryptoTest.kt"
+          test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
           grep -Fq 'persistedVerifierDoesNotContainThePassphrase' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
           grep -Fq 'internal fun createRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
           grep -Fq 'internal fun verifyRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
@@ -88,9 +90,10 @@ jobs:
           grep -Fq 'androidx.camera:camera-lifecycle:1.5.3' "$BUILD_FILE"
           grep -Fq 'androidx.camera:camera-view:1.5.3' "$BUILD_FILE"
           grep -Fq 'namespace = "infernics.notes"' "$BUILD_FILE"
-          grep -Fq 'versionCode = 18' "$BUILD_FILE"
-          grep -Fq 'versionName = "1.4.10"' "$BUILD_FILE"
+          grep -Fq 'versionCode = 19' "$BUILD_FILE"
+          grep -Fq 'versionName = "1.4.11"' "$BUILD_FILE"
           grep -Fq 'SecNoteVaultSaltKey' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
+          grep -Fq 'fun matchesPassphrase' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'StorageGate.blockAndDrain()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
           grep -Fq 'Crypto.destroyAll()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
           grep -Fq 'getExternalFilesDirs(null)' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
@@ -118,6 +121,8 @@ jobs:
           grep -Fq 'StorageGate.resumeAfterUnlock()' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'StorageGate.resumeAfterNewVault()' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'StorageGate.withAccess(generation)' "$PROJECT_DIR/app/src/main/java/infernics/notes/HiddenVault.kt"
+          grep -Fq 'fun <T> withExclusiveAccess(action: () -> T)' "$PROJECT_DIR/app/src/main/java/infernics/notes/StorageGate.kt"
+          grep -Fq 'StorageGate.withExclusiveAccess' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
           grep -Fq 'NoteSaveQueue.awaitIdle()' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'fun reorder(' "$PROJECT_DIR/app/src/main/java/infernics/notes/NoteRepository.kt"
           grep -Fq 'getAutoLockMinutes' "$PROJECT_DIR/app/src/main/java/infernics/notes/AppPreferences.kt"
@@ -162,7 +167,23 @@ jobs:
           grep -Fq 'selected = !darkTheme' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'selected = darkTheme' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'FlowRow(' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
-          echo "Verified: infernics.notes, SecNote 1.4.10 (code 18), independent password-derived encrypted file area, session-only hidden key, no hidden-key biometric route, global emergency destruction and legacy features"
+          grep -Fq 'fun exportBackup(' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'fun restoreBackup(' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'backupCrypto.encryptStream(streamInput, output)' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'activeBackupCrypto.decryptStream(input, decryptedOutput)' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'validateVaultPayload(payload' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'recoverInterruptedRestore(this)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'backupOperationInProgress' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'onBackupRestored' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'ActivityResultContracts.CreateDocument' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'ActivityResultContracts.OpenDocument' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'installPortableState' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
+          grep -Fq 'backupSettings' "$PROJECT_DIR/app/src/main/java/infernics/notes/AppPreferences.kt"
+          grep -Fq 'hidden/${HiddenVault.METADATA_FILE_NAME}' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'portableVerifierRecordHasAnExactExpectedLength' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
+          grep -Fq 'BackupArchiveRules.validateFilePairs' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'validatesPairedFilePayloads' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
+          echo "Verified: infernics.notes, SecNote 1.4.11 (code 19), encrypted portable backup/restore, primary and secondary encrypted stores, transactional rollback, preserved legacy features"
 
       - name: Run unit tests and build APK
         run: gradle -p "${{ steps.project.outputs.dir }}" clean testDebugUnitTest assembleDebug --no-daemon --stacktrace
