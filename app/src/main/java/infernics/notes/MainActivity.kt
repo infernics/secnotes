@@ -108,6 +108,9 @@ class MainActivity : FragmentActivity() {
     // Temporary system authentication/document-picker UI is an intentional user action.
     @Volatile var allowTemporarySystemUi: Boolean = false
     @Volatile var stoppedDuringTemporarySystemUi: Boolean = false
+    // File/document pickers are user-driven workflows and must not force an unlock
+    // when Android returns the Activity. Biometric prompt keeps its existing policy.
+    @Volatile var preserveSessionOnTemporaryUiReturn: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -185,11 +188,17 @@ private fun SecNoteApp(activity: MainActivity) {
                     }
                 }
                 Lifecycle.Event.ON_RESUME -> {
-                    if (activity.stoppedDuringTemporarySystemUi && !activity.allowTemporarySystemUi) {
+                    if (activity.stoppedDuringTemporarySystemUi) {
+                        // A document picker is an intentional in-app workflow, not an
+                        // ordinary background transition. Preserve the current session
+                        // only for those pickers; biometric prompts keep their prior policy.
+                        val preserveSession = activity.preserveSessionOnTemporaryUiReturn
                         activity.stoppedDuringTemporarySystemUi = false
+                        activity.allowTemporarySystemUi = false
+                        activity.preserveSessionOnTemporaryUiReturn = false
                         backgroundAtElapsed = 0L
                         pendingLockJob?.cancel()
-                        crypto = null
+                        if (!preserveSession) crypto = null
                     } else if (backgroundAtElapsed != 0L) {
                         pendingLockJob?.cancel()
                         val elapsed = SystemClock.elapsedRealtime() - backgroundAtElapsed
@@ -1431,6 +1440,20 @@ private fun SettingRow(
     }
 }
 
+/** Extract SAF single- and multi-select results without losing ClipData URIs. */
+private fun selectedDocumentUris(data: Intent?): List<Uri> {
+    if (data == null) return emptyList()
+    val selected = mutableListOf<Uri>()
+    data.data?.let { selected.add(it) }
+    val clip = data.clipData
+    if (clip != null) {
+        for (index in 0 until clip.itemCount) {
+            clip.getItemAt(index).uri?.let { selected.add(it) }
+        }
+    }
+    return selected.distinctBy { it.toString() }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FileVaultScreen(
@@ -1449,8 +1472,6 @@ private fun FileVaultScreen(
     var pendingExport by remember { mutableStateOf<VaultFile?>(null) }
     var deleteTarget by remember { mutableStateOf<VaultFile?>(null) }
     var previewTarget by remember { mutableStateOf<VaultFile?>(null) }
-    var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
-    var lockAfterPendingImport by remember { mutableStateOf(false) }
     var selectedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var selectionMode by remember { mutableStateOf(false) }
     var confirmBatchDelete by remember { mutableStateOf(false) }
@@ -1468,42 +1489,70 @@ private fun FileVaultScreen(
         selectionMode = true
     }
 
-    fun finishTemporaryPicker(lockAfterPicker: Boolean) {
+    fun finishTemporaryPicker() {
         activity.allowTemporarySystemUi = false
         activity.stoppedDuringTemporarySystemUi = false
-        if (lockAfterPicker) onLock()
+        activity.preserveSessionOnTemporaryUiReturn = false
     }
 
     LaunchedEffect(crypto) { reload() }
 
-    // Ask for read + write access because importing now also attempts best-effort
-    // overwrite/delete of the source after an encrypted copy is committed.
+    // Import uses ACTION_OPEN_DOCUMENT with EXTRA_ALLOW_MULTIPLE. Selected documents
+    // are encrypted immediately; the old confirmation dialog is intentionally removed.
     val importLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        activity.allowTemporarySystemUi = false
-        val lockAfterPicker = activity.stoppedDuringTemporarySystemUi
-        activity.stoppedDuringTemporarySystemUi = false
-        val uri = if (result.resultCode == Activity.RESULT_OK) result.data?.data else null
-        if (uri != null) {
-            val flags = (result.data?.flags ?: 0) and
+        finishTemporaryPicker()
+        val data = result.data
+        val uris = if (result.resultCode == Activity.RESULT_OK) {
+            selectedDocumentUris(data)
+        } else emptyList()
+
+        if (uris.isNotEmpty()) {
+            val grantFlags = (data?.flags ?: 0) and
                 (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            if (flags != 0) {
-                runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
+            val persistableGrant = data?.let {
+                it.flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION != 0
+            } == true
+            if (persistableGrant && grantFlags != 0) {
+                uris.forEach { uri ->
+                    runCatching { context.contentResolver.takePersistableUriPermission(uri, grantFlags) }
+                }
             }
-            pendingImportUri = uri
-            lockAfterPendingImport = lockAfterPicker
-        } else if (lockAfterPicker) {
-            onLock()
+
+            busy = true
+            message = null
+            scope.launch {
+                val resultBatch = withContext(Dispatchers.IO) {
+                    runCatching { repository.importManyAndRemoveOriginal(uris) }
+                }
+                busy = false
+                resultBatch.onSuccess { batch ->
+                    message = buildString {
+                        append("Добавлено в защищённое хранилище: ${batch.imported}.")
+                        append(" Оригиналы перезаписаны: ${batch.originalsOverwritten}; удалены провайдером: ${batch.originalsDeleted}.")
+                        if (batch.failedNames.isNotEmpty()) {
+                            append(" Не удалось обработать: ${batch.failedNames.joinToString()}")
+                        }
+                        if (batch.imported > batch.originalsDeleted) {
+                            append(" Некоторые исходники могли остаться — проверьте исходное расположение.")
+                        }
+                    }
+                }.onFailure { error ->
+                    message = "Не удалось выполнить импорт: ${error.message ?: "ошибка чтения"}. Исходные файлы не удалялись этим шагом."
+                }
+                reload()
+            }
+        } else {
+            // Cancelled or empty picker result: keep the user in the vault, do nothing.
+            message = null
         }
     }
 
     val exportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/octet-stream")
     ) { uri ->
-        activity.allowTemporarySystemUi = false
-        val lockAfterPicker = activity.stoppedDuringTemporarySystemUi
-        activity.stoppedDuringTemporarySystemUi = false
+        finishTemporaryPicker()
         val item = pendingExport
         pendingExport = null
         if (uri != null && item != null) {
@@ -1515,19 +1564,14 @@ private fun FileVaultScreen(
                 result.onSuccess { message = "Файл расшифрован и сохранён в выбранное место." }
                     .onFailure { message = "Не удалось экспортировать файл: ${it.message ?: "ошибка записи"}" }
                 reload()
-                if (lockAfterPicker) onLock()
             }
-        } else if (lockAfterPicker) {
-            onLock()
         }
     }
 
     val treeLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { treeUri ->
-        activity.allowTemporarySystemUi = false
-        val lockAfterPicker = activity.stoppedDuringTemporarySystemUi
-        activity.stoppedDuringTemporarySystemUi = false
+        finishTemporaryPicker()
         val ids = pendingBatchExportIds
         pendingBatchExportIds = emptyList()
         if (treeUri != null && ids.isNotEmpty()) {
@@ -1550,16 +1594,14 @@ private fun FileVaultScreen(
                 }.onFailure { message = "Ошибка массовой расшифровки: ${it.message ?: "неизвестная ошибка"}" }
                 selectedIds = emptySet()
                 selectionMode = false
-                if (lockAfterPicker) onLock()
             }
-        } else if (lockAfterPicker) {
-            onLock()
         }
     }
 
     fun requestExport(item: VaultFile) {
         pendingExport = item
         activity.allowTemporarySystemUi = true
+        activity.preserveSessionOnTemporaryUiReturn = true
         exportLauncher.launch(item.name)
     }
 
@@ -1567,64 +1609,11 @@ private fun FileVaultScreen(
         if (selectedIds.isEmpty()) return
         pendingBatchExportIds = selectedIds.toList()
         activity.allowTemporarySystemUi = true
+        activity.preserveSessionOnTemporaryUiReturn = true
         treeLauncher.launch(null)
     }
 
-    // The import dialog makes the destructive source-file operation explicit.
-    pendingImportUri?.let { uri ->
-        AlertDialog(
-            onDismissRequest = {
-                pendingImportUri = null
-                finishTemporaryPicker(lockAfterPendingImport)
-            },
-            title = { Text("Переместить файл в защищённое хранилище?") },
-            text = {
-                Text(
-                    "SecNote сначала создаст и проверит зашифрованную копию. Затем приложение попробует " +
-                        "перезаписать исходный файл нулями и удалить его. Если провайдер не разрешит запись " +
-                        "или удаление, оригинал может остаться. На SSD/flash-памяти и в облачных хранилищах " +
-                        "физическое уничтожение прежних блоков гарантировать нельзя."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    pendingImportUri = null
-                    busy = true
-                    message = null
-                    scope.launch {
-                        val result = withContext(Dispatchers.IO) {
-                            runCatching { repository.importAndRemoveOriginal(uri) }
-                        }
-                        busy = false
-                        result.onSuccess { imported ->
-                            message = when {
-                                imported.originalOverwritten && imported.originalDeleted ->
-                                    "Файл зашифрован. Исходник перезаписан на уровне провайдера и удалён; физическое стирание не гарантируется."
-                                imported.originalDeleted ->
-                                    "Файл зашифрован. Провайдер удалил оригинал, но перезапись подтвердить не удалось."
-                                imported.originalOverwritten ->
-                                    "Файл зашифрован. Исходник перезаписан, но провайдер не подтвердил удаление. Проверьте исходную папку."
-                                else ->
-                                    "Зашифрованная копия создана, но исходник не удалось перезаписать или удалить. Удалите его вручную из исходного приложения."
-                            }
-                            reload()
-                        }.onFailure {
-                            message = "Не удалось зашифровать файл: ${it.message ?: "ошибка чтения"}. Оригинал не удалялся."
-                        }
-                        finishTemporaryPicker(lockAfterPendingImport)
-                        lockAfterPendingImport = false
-                    }
-                }) { Text("Зашифровать и удалить оригинал") }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    pendingImportUri = null
-                    finishTemporaryPicker(lockAfterPendingImport)
-                    lockAfterPendingImport = false
-                }) { Text("Отмена") }
-            }
-        )
-    }
+    // Import begins immediately after the user confirms file selection in Android's picker.
 
     if (deleteTarget != null) {
         val item = deleteTarget!!
@@ -1739,6 +1728,7 @@ private fun FileVaultScreen(
                     val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "*/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                         addFlags(
                             Intent.FLAG_GRANT_READ_URI_PERMISSION or
                                 Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
@@ -1746,6 +1736,7 @@ private fun FileVaultScreen(
                         )
                     }
                     activity.allowTemporarySystemUi = true
+                    activity.preserveSessionOnTemporaryUiReturn = true
                     importLauncher.launch(intent)
                 }
             ) {

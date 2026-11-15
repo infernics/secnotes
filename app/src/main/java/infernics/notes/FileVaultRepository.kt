@@ -33,6 +33,13 @@ data class BatchExportResult(
     val failedNames: List<String>
 )
 
+data class BatchImportResult(
+    val imported: Int,
+    val originalsOverwritten: Int,
+    val originalsDeleted: Int,
+    val failedNames: List<String>
+)
+
 /**
  * Independent encrypted file area. Each file has its own authenticated content stream
  * and encrypted metadata. Plaintext is written only to short-lived private cache files
@@ -80,6 +87,36 @@ class FileVaultRepository(
         val overwritten = bestEffortOverwriteSource(uri)
         val deleted = bestEffortDeleteSource(uri)
         VaultImportResult(item, overwritten, deleted)
+    }
+
+    /**
+     * Import multiple SAF documents sequentially. Each source is encrypted and
+     * committed independently before its original is touched. One failed provider
+     * does not prevent the remaining selected files from being imported.
+     */
+    fun importManyAndRemoveOriginal(uris: Collection<Uri>): BatchImportResult {
+        var imported = 0
+        var overwritten = 0
+        var deleted = 0
+        val failedNames = mutableListOf<String>()
+        uris.distinctBy { it.toString() }.forEach { uri ->
+            val displayName = queryDisplayName(uri).ifBlank { "Выбранный файл" }
+            runCatching { importAndRemoveOriginal(uri) }
+                .onSuccess { result ->
+                    imported++
+                    if (result.originalOverwritten) overwritten++
+                    if (result.originalDeleted) deleted++
+                }
+                .onFailure {
+                    failedNames += displayName.take(120)
+                }
+        }
+        return BatchImportResult(
+            imported = imported,
+            originalsOverwritten = overwritten,
+            originalsDeleted = deleted,
+            failedNames = failedNames
+        )
     }
 
     private fun importEncryptedCopy(uri: Uri): VaultFile {
