@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Test and build SecNote 1.4.9
+    name: Test and build SecNote 1.4.10
     runs-on: ubuntu-latest
 
     steps:
@@ -75,6 +75,7 @@ jobs:
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/AutoLockPolicyTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/ThumbnailDecodePolicyTest.kt"
+          test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/CryptoTest.kt"
           grep -Fq 'persistedVerifierDoesNotContainThePassphrase' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
           grep -Fq 'internal fun createRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
           grep -Fq 'internal fun verifyRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
@@ -87,8 +88,8 @@ jobs:
           grep -Fq 'androidx.camera:camera-lifecycle:1.5.3' "$BUILD_FILE"
           grep -Fq 'androidx.camera:camera-view:1.5.3' "$BUILD_FILE"
           grep -Fq 'namespace = "infernics.notes"' "$BUILD_FILE"
-          grep -Fq 'versionCode = 17' "$BUILD_FILE"
-          grep -Fq 'versionName = "1.4.9"' "$BUILD_FILE"
+          grep -Fq 'versionCode = 18' "$BUILD_FILE"
+          grep -Fq 'versionName = "1.4.10"' "$BUILD_FILE"
           grep -Fq 'SecNoteVaultSaltKey' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'StorageGate.blockAndDrain()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
           grep -Fq 'Crypto.destroyAll()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
@@ -148,7 +149,12 @@ jobs:
           grep -Fq 'ThumbnailDecodePolicy.sampleSize(width, height, maxDimension)' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
           grep -Fq 'inPreferredConfig = Bitmap.Config.RGB_565' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
           grep -Fq 'catch (_: OutOfMemoryError)' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          ! grep -Fq 'DisposableEffect(thumbnail)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          ! grep -Fq 'DisposableEffect(bitmap)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          ! grep -Fq 'bitmap.recycle()' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'previewLoadFinished' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'cameraSizedPhotoIsDecodedWithBoundedSampling' "$PROJECT_DIR/app/src/test/java/infernics/notes/ThumbnailDecodePolicyTest.kt"
+          grep -Fq 'jpegPayloadSurvivesVaultStreamingEncryption' "$PROJECT_DIR/app/src/test/java/infernics/notes/CryptoTest.kt"
           ! grep -Fq 'IconButton(onClick = onOpenCamera)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           ! grep -Fq 'ImageCapture.OutputFileOptions' "$PROJECT_DIR/app/src/main/java/infernics/notes/CameraCaptureScreen.kt"
           ! grep -Fq 'lockAfterPicker' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
@@ -156,7 +162,7 @@ jobs:
           grep -Fq 'selected = !darkTheme' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'selected = darkTheme' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'FlowRow(' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
-          echo "Verified: infernics.notes, SecNote 1.4.9 (code 17), independent password-derived encrypted file area, session-only hidden key, no hidden-key biometric route, global emergency destruction and legacy features"
+          echo "Verified: infernics.notes, SecNote 1.4.10 (code 18), independent password-derived encrypted file area, session-only hidden key, no hidden-key biometric route, global emergency destruction and legacy features"
 
       - name: Run unit tests and build APK
         run: gradle -p "${{ steps.project.outputs.dir }}" clean testDebugUnitTest assembleDebug --no-daemon --stacktrace
