@@ -13,7 +13,7 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.security.auth.Destroyable
 import java.util.Collections
-import java.util.WeakHashMap
+import java.util.IdentityHashMap
 
 /**
  * AES-256-GCM encryption for both note records and vault files.
@@ -24,7 +24,7 @@ class Crypto private constructor(rawKey: ByteArray) {
     private val key: SecretKey = WipeableAesKey(rawKey)
 
     init {
-        synchronized(LIVE_INSTANCES) { LIVE_INSTANCES[this] = true }
+        synchronized(LIVE_INSTANCES) { LIVE_INSTANCES.add(this) }
     }
 
     /** Best-effort zeroisation of this in-memory content key. */
@@ -48,7 +48,14 @@ class Crypto private constructor(rawKey: ByteArray) {
 
     fun encrypt(text: String): ByteArray = encrypt(text.toByteArray(Charsets.UTF_8))
 
-    fun decryptToText(blob: ByteArray): String = String(decrypt(blob), Charsets.UTF_8)
+    fun decryptToText(blob: ByteArray): String {
+        val plaintext = decrypt(blob)
+        return try {
+            String(plaintext, Charsets.UTF_8)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
 
     /**
      * Chunked AES-GCM file format. Each 64 KiB chunk has its own random IV and
@@ -62,41 +69,56 @@ class Crypto private constructor(rawKey: ByteArray) {
         var chunkIndex = 0
         var totalBytes = 0L
 
-        while (true) {
-            var count = input.read(buffer)
-            if (count < 0) break
-            if (count == 0) {
-                // InputStream may legally return zero for a non-empty buffer.
-                // Force progress rather than spinning indefinitely.
-                val singleByte = input.read()
-                if (singleByte < 0) break
-                buffer[0] = singleByte.toByte()
-                count = 1
+        try {
+            while (true) {
+                var count = input.read(buffer)
+                if (count < 0) break
+                if (count == 0) {
+                    // InputStream may legally return zero for a non-empty buffer.
+                    // Force progress rather than spinning indefinitely.
+                    val singleByte = input.read()
+                    if (singleByte < 0) break
+                    buffer[0] = singleByte.toByte()
+                    count = 1
+                }
+
+                val iv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
+                val cipher = fileCipher(Cipher.ENCRYPT_MODE, iv).apply {
+                    updateAAD(chunkAad(chunkIndex, count))
+                }
+                val encrypted = cipher.doFinal(buffer, 0, count)
+                try {
+                    data.writeInt(count)
+                    data.write(iv)
+                    data.write(encrypted)
+                } finally {
+                    encrypted.fill(0)
+                    iv.fill(0)
+                }
+                chunkIndex++
+                totalBytes += count
             }
 
-            val iv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
-            val cipher = fileCipher(Cipher.ENCRYPT_MODE, iv).apply {
-                updateAAD(chunkAad(chunkIndex, count))
+            val footer = ByteBuffer.allocate(12).putInt(chunkIndex).putLong(totalBytes).array()
+            val footerIv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
+            val footerCipher = fileCipher(Cipher.ENCRYPT_MODE, footerIv).apply {
+                updateAAD(footerAad(chunkIndex))
             }
-            val encrypted = cipher.doFinal(buffer, 0, count)
-            data.writeInt(count)
-            data.write(iv)
-            data.write(encrypted)
-            chunkIndex++
-            totalBytes += count
+            val encryptedFooter = footerCipher.doFinal(footer)
+            try {
+                data.writeInt(0) // terminal record; followed by an authenticated footer
+                data.write(footerIv)
+                data.write(encryptedFooter)
+                data.flush()
+            } finally {
+                footer.fill(0)
+                footerIv.fill(0)
+                encryptedFooter.fill(0)
+            }
+            return totalBytes
+        } finally {
+            buffer.fill(0)
         }
-
-        val footer = ByteBuffer.allocate(12).putInt(chunkIndex).putLong(totalBytes).array()
-        val footerIv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
-        val footerCipher = fileCipher(Cipher.ENCRYPT_MODE, footerIv).apply {
-            updateAAD(footerAad(chunkIndex))
-        }
-        val encryptedFooter = footerCipher.doFinal(footer)
-        data.writeInt(0) // terminal record; followed by an authenticated footer
-        data.write(footerIv)
-        data.write(encryptedFooter)
-        data.flush()
-        return totalBytes
     }
 
     /** Each chunk is authenticated before its plaintext is written to the private temp file. */
@@ -118,28 +140,42 @@ class Crypto private constructor(rawKey: ByteArray) {
             data.readFully(encrypted)
 
             if (plainLength == 0) {
-                val footerCipher = fileCipher(Cipher.DECRYPT_MODE, iv).apply {
-                    updateAAD(footerAad(chunkIndex))
+                var footerBytes: ByteArray? = null
+                try {
+                    val footerCipher = fileCipher(Cipher.DECRYPT_MODE, iv).apply {
+                        updateAAD(footerAad(chunkIndex))
+                    }
+                    footerBytes = footerCipher.doFinal(encrypted)
+                    val footer = ByteBuffer.wrap(footerBytes)
+                    val expectedChunks = footer.int
+                    val expectedBytes = footer.long
+                    require(expectedChunks == chunkIndex && expectedBytes == totalBytes) {
+                        "Encrypted file footer does not match its contents"
+                    }
+                    require(data.read() == -1) { "Unexpected data after encrypted file footer" }
+                    output.flush()
+                    return totalBytes
+                } finally {
+                    footerBytes?.fill(0)
+                    iv.fill(0)
+                    encrypted.fill(0)
                 }
-                val footer = ByteBuffer.wrap(footerCipher.doFinal(encrypted))
-                val expectedChunks = footer.int
-                val expectedBytes = footer.long
-                require(expectedChunks == chunkIndex && expectedBytes == totalBytes) {
-                    "Encrypted file footer does not match its contents"
-                }
-                require(data.read() == -1) { "Unexpected data after encrypted file footer" }
-                output.flush()
-                return totalBytes
             }
 
             val cipher = fileCipher(Cipher.DECRYPT_MODE, iv).apply {
                 updateAAD(chunkAad(chunkIndex, plainLength))
             }
             val plain = cipher.doFinal(encrypted)
-            require(plain.size == plainLength) { "Invalid decrypted block length" }
-            output.write(plain)
-            totalBytes += plain.size
-            chunkIndex++
+            try {
+                require(plain.size == plainLength) { "Invalid decrypted block length" }
+                output.write(plain)
+                totalBytes += plain.size
+                chunkIndex++
+            } finally {
+                plain.fill(0)
+                iv.fill(0)
+                encrypted.fill(0)
+            }
         }
     }
 
@@ -171,12 +207,12 @@ class Crypto private constructor(rawKey: ByteArray) {
 
     companion object {
         private val SECURE_RANDOM = SecureRandom()
-        private val LIVE_INSTANCES = Collections.synchronizedMap(WeakHashMap<Crypto, Boolean>())
+        private val LIVE_INSTANCES = Collections.newSetFromMap(IdentityHashMap<Crypto, Boolean>())
 
         /** Destroy all currently reachable SecNote content keys after storage operations drain. */
         internal fun destroyAll() {
             val instances = synchronized(LIVE_INSTANCES) {
-                LIVE_INSTANCES.keys.toList().also { LIVE_INSTANCES.clear() }
+                LIVE_INSTANCES.toList().also { LIVE_INSTANCES.clear() }
             }
             instances.forEach { it.destroy() }
         }

@@ -51,11 +51,16 @@ data class BatchImportResult(
  */
 class FileVaultRepository(
     private val context: Context,
-    private val crypto: Crypto
+    private val crypto: Crypto,
+    private val storageDirectoryName: String = "file_vault"
 ) {
     private val generation = StorageGate.currentGeneration()
+    private val cachePrefix = if (storageDirectoryName == HiddenVault.DIRECTORY_NAME) "media" else "secnote"
     private val root = StorageGate.withAccess(generation) {
-        File(context.filesDir, "file_vault").apply { mkdirs() }
+        require(storageDirectoryName == "file_vault" || storageDirectoryName == HiddenVault.DIRECTORY_NAME) {
+            "Недопустимое файловое пространство"
+        }
+        File(context.filesDir, storageDirectoryName).apply { mkdirs() }
     }
 
     init {
@@ -64,7 +69,7 @@ class FileVaultRepository(
             // short-lived plaintext, so use best-effort overwrite before deleting them.
             root.listFiles { file -> file.name.endsWith(".tmp") }?.forEach(::overwriteAndDelete)
             context.cacheDir.listFiles { file ->
-                file.name.startsWith("secnote-export-") || file.name.startsWith("secnote-thumbnail-")
+                file.name.startsWith("$cachePrefix-export-") || file.name.startsWith("$cachePrefix-thumbnail-")
             }?.forEach(::overwriteAndDelete)
             cleanupOrphans()
         }
@@ -342,7 +347,7 @@ class FileVaultRepository(
 
     /** Decrypt into a private temp file, then stream the verified data to the destination. */
     private fun exportVerified(item: VaultFile, destination: Uri) {
-        val verifiedPlaintext = File.createTempFile("secnote-export-", ".tmp", context.cacheDir)
+        val verifiedPlaintext = File.createTempFile("$cachePrefix-export-", ".tmp", context.cacheDir)
         try {
             dataFile(item.id).inputStream().use { encryptedInput ->
                 verifiedPlaintext.outputStream().use { temporaryOutput ->
@@ -365,7 +370,7 @@ class FileVaultRepository(
      */
     fun loadThumbnail(id: String, maxDimension: Int = 420): Bitmap? = StorageGate.withAccess(generation) {
         require(maxDimension in 64..2048) { "Invalid thumbnail dimension" }
-        val temporaryPlaintext = File.createTempFile("secnote-thumbnail-", ".tmp", context.cacheDir)
+        val temporaryPlaintext = File.createTempFile("$cachePrefix-thumbnail-", ".tmp", context.cacheDir)
         try {
             readMetadata(id)
             dataFile(id).inputStream().use { encryptedInput ->
@@ -415,14 +420,21 @@ class FileVaultRepository(
         runCatching {
             val originalLength = file.length()
             RandomAccessFile(file, "rw").use { stream ->
-                stream.seek(0L)
-                val zeros = ByteArray(64 * 1024)
-                var remaining = originalLength
-                while (remaining > 0L) {
-                    val count = minOf(zeros.size.toLong(), remaining).toInt()
-                    stream.write(zeros, 0, count)
-                    remaining -= count.toLong()
+                val block = ByteArray(64 * 1024)
+                val random = java.security.SecureRandom()
+                // Best-effort logical overwrite: random data first, zeroes second.
+                repeat(2) { pass ->
+                    stream.seek(0L)
+                    var remaining = originalLength
+                    while (remaining > 0L) {
+                        val count = minOf(block.size.toLong(), remaining).toInt()
+                        if (pass == 0) random.nextBytes(block) else block.fill(0)
+                        stream.write(block, 0, count)
+                        remaining -= count.toLong()
+                    }
+                    stream.fd.sync()
                 }
+                block.fill(0)
                 stream.setLength(originalLength)
                 stream.fd.sync()
             }
@@ -464,5 +476,43 @@ class FileVaultRepository(
             .map { it.name.removeSuffix(".meta.enc") }.toSet()
         (dataIds - metadataIds).forEach { overwriteAndDelete(dataFile(it)) }
         (metadataIds - dataIds).forEach { overwriteAndDelete(metadataFile(it)) }
+    }
+
+    companion object {
+        /** Removes plaintext temp files left by a process crash before any vault is opened. */
+        fun cleanupAbandonedTemporaryFiles(context: Context) {
+            val prefixes = listOf(
+                "secnote-export-", "secnote-thumbnail-",
+                "media-export-", "media-thumbnail-"
+            )
+            context.cacheDir.listFiles { file -> prefixes.any { prefix -> file.name.startsWith(prefix) } }
+                ?.forEach(::overwriteAndDeleteTemporary)
+        }
+
+        private fun overwriteAndDeleteTemporary(file: File) {
+            if (!file.exists() || !file.isFile) return
+            runCatching {
+                val originalLength = file.length()
+                RandomAccessFile(file, "rw").use { stream ->
+                    val block = ByteArray(32 * 1024)
+                    val random = java.security.SecureRandom()
+                    repeat(2) { pass ->
+                        stream.seek(0L)
+                        var remaining = originalLength
+                        while (remaining > 0L) {
+                            val count = minOf(block.size.toLong(), remaining).toInt()
+                            if (pass == 0) random.nextBytes(block) else block.fill(0)
+                            stream.write(block, 0, count)
+                            remaining -= count
+                        }
+                        stream.fd.sync()
+                    }
+                    block.fill(0)
+                    stream.setLength(originalLength)
+                    stream.fd.sync()
+                }
+            }
+            file.delete()
+        }
     }
 }

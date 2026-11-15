@@ -5,6 +5,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.security.KeyStore
+import java.security.SecureRandom
 import java.util.Collections
 
 /**
@@ -55,7 +56,8 @@ object EmergencyWipe {
 
             // Invalidate the current password-derived key material before wiping payloads.
             val criticalMaterialsClean = listOf(
-                "key.salt", "key.check", "panic.credential", "key.salt.tmp", "key.check.tmp"
+                "key.salt", "key.check", "panic.credential", "key.salt.tmp", "key.check.tmp",
+                HiddenVault.METADATA_FILE_NAME, "${HiddenVault.METADATA_FILE_NAME}.tmp"
             ).all { name -> wipeEntry(File(context.filesDir, name)) }
             if (!criticalMaterialsClean) return false
 
@@ -63,6 +65,9 @@ object EmergencyWipe {
                 add(context.filesDir)
                 add(context.cacheDir)
                 add(context.codeCacheDir)
+                addAll(context.getExternalFilesDirs(null).filterNotNull())
+                addAll(context.externalCacheDirs.filterNotNull())
+                add(context.obbDir)
                 add(File(context.applicationInfo.dataDir, SHARED_PREFS))
                 add(File(context.applicationInfo.dataDir, "databases"))
                 add(File(context.applicationInfo.dataDir, "app_webview"))
@@ -87,6 +92,8 @@ object EmergencyWipe {
             if (File(context.filesDir, "panic.credential").exists()) return false
             if (File(context.filesDir, "notes").exists()) return false
             if (File(context.filesDir, "file_vault").exists()) return false
+            if (File(context.filesDir, HiddenVault.DIRECTORY_NAME).exists()) return false
+            if (File(context.filesDir, HiddenVault.METADATA_FILE_NAME).exists()) return false
 
             marker.delete()
         } catch (_: Exception) {
@@ -134,14 +141,23 @@ object EmergencyWipe {
         runCatching {
             val originalLength = file.length()
             RandomAccessFile(file, "rw").use { stream ->
-                stream.seek(0L)
-                val zeros = ByteArray(64 * 1024)
-                var remaining = originalLength
-                while (remaining > 0L) {
-                    val count = minOf(zeros.size.toLong(), remaining).toInt()
-                    stream.write(zeros, 0, count)
-                    remaining -= count.toLong()
+                val block = ByteArray(64 * 1024)
+                val random = SecureRandom()
+                // Two logical overwrite passes (random data, then zeroes) are a best-effort
+                // layer only; cryptographic key destruction remains the primary safeguard
+                // because flash controllers may remap physical blocks (wear levelling).
+                repeat(2) { pass ->
+                    stream.seek(0L)
+                    var remaining = originalLength
+                    while (remaining > 0L) {
+                        val count = minOf(block.size.toLong(), remaining).toInt()
+                        if (pass == 0) random.nextBytes(block) else block.fill(0)
+                        stream.write(block, 0, count)
+                        remaining -= count.toLong()
+                    }
+                    stream.fd.sync()
                 }
+                block.fill(0)
                 stream.setLength(originalLength)
                 stream.fd.sync()
             }

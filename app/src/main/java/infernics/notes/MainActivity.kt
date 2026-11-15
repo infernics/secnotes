@@ -11,6 +11,9 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
@@ -117,6 +120,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Clear plaintext previews/exports left behind if Android killed a prior operation.
+        runCatching { FileVaultRepository.cleanupAbandonedTemporaryFiles(this) }
         if (AppPreferences.isScreenshotBlockingEnabled(this)) {
             window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
         }
@@ -133,6 +138,7 @@ private fun SecNoteApp(activity: MainActivity) {
     var darkTheme by remember { mutableStateOf(AppPreferences.isDarkTheme(context)) }
     var biometricEnabled by remember { mutableStateOf(BiometricVault.isEnabled(context)) }
     var panicPasswordConfigured by remember { mutableStateOf(PanicCredential.isConfigured(context)) }
+    var hiddenVaultConfigured by remember { mutableStateOf(HiddenVault.isConfigured(context)) }
     var screenshotBlockingEnabled by remember {
         mutableStateOf(AppPreferences.isScreenshotBlockingEnabled(context))
     }
@@ -140,6 +146,30 @@ private fun SecNoteApp(activity: MainActivity) {
     var wipePending by remember { mutableStateOf(EmergencyWipe.isPending(context)) }
     var wipeFailed by remember { mutableStateOf(false) }
     var wipeAttempt by remember { mutableStateOf(0) }
+    var lockCleanupPending by remember { mutableStateOf(false) }
+    val lockMainVault: () -> Unit = {
+        if (crypto != null && !lockCleanupPending) {
+            lockCleanupPending = true
+            appScope.launch {
+                // Let Activity/Editor lifecycle observers enqueue their last autosave first.
+                delay(75)
+                val storageBlocked = withContext(Dispatchers.IO) {
+                    // A queue barrier is helpful, but a failed barrier must never skip
+                    // StorageGate's definitive drain of active repository operations.
+                    runCatching { NoteSaveQueue.awaitIdle() }
+                    val blocked = runCatching { StorageGate.blockAndDrain() }.isSuccess
+                    if (blocked) Crypto.destroyAll()
+                    blocked
+                }
+                if (!storageBlocked) {
+                    // Do not leave the old UI/key available if an unexpected lock failure occurs.
+                    Crypto.destroyAll()
+                }
+                crypto = null
+                lockCleanupPending = false
+            }
+        }
+    }
 
     // A wipe marker is durable and is handled before either the unlock or setup screen.
     LaunchedEffect(wipePending, wipeAttempt) {
@@ -152,6 +182,7 @@ private fun SecNoteApp(activity: MainActivity) {
                 needsSetup = true
                 biometricEnabled = false
                 panicPasswordConfigured = false
+                hiddenVaultConfigured = false
                 darkTheme = true
                 screenshotBlockingEnabled = false
                 autoLockMinutes = 0
@@ -179,12 +210,12 @@ private fun SecNoteApp(activity: MainActivity) {
                         backgroundAtElapsed = SystemClock.elapsedRealtime()
                         pendingLockJob?.cancel()
                         when {
-                            AutoLockPolicy.shouldLockImmediately(autoLockMinutes) -> crypto = null
+                            AutoLockPolicy.shouldLockImmediately(autoLockMinutes) -> lockMainVault()
                             autoLockMinutes > 0 -> {
                                 pendingLockJob = appScope.launch {
                                     delay(timeoutMs)
                                     if (backgroundAtElapsed != 0L && !activity.allowTemporarySystemUi) {
-                                        crypto = null
+                                        lockMainVault()
                                     }
                                 }
                             }
@@ -205,11 +236,11 @@ private fun SecNoteApp(activity: MainActivity) {
                         activity.preserveSessionOnTemporaryUiReturn = false
                         backgroundAtElapsed = 0L
                         pendingLockJob?.cancel()
-                        if (!preserveSession) crypto = null
+                        if (!preserveSession) lockMainVault()
                     } else if (backgroundAtElapsed != 0L) {
                         pendingLockJob?.cancel()
                         val elapsed = SystemClock.elapsedRealtime() - backgroundAtElapsed
-                        if (AutoLockPolicy.shouldLockAfterBackground(autoLockMinutes, elapsed)) crypto = null
+                        if (AutoLockPolicy.shouldLockAfterBackground(autoLockMinutes, elapsed)) lockMainVault()
                         backgroundAtElapsed = 0L
                     }
                 }
@@ -252,13 +283,19 @@ private fun SecNoteApp(activity: MainActivity) {
                     failed = wipeFailed,
                     onRetry = { wipeFailed = false; wipeAttempt++ }
                 )
+                lockCleanupPending -> LockingScreen()
                 crypto == null && needsSetup -> SetupScreen(onCreated = {
                     crypto = it
                     needsSetup = false
                 })
                 crypto == null -> LockScreen(
                     biometricEnabled = biometricEnabled,
-                    onUnlocked = { crypto = it },
+                    onUnlocked = {
+                        StorageGate.resumeAfterUnlock()
+                        panicPasswordConfigured = PanicCredential.isConfigured(context)
+                        hiddenVaultConfigured = HiddenVault.isConfigured(context)
+                        crypto = it
+                    },
                     onEmergencyWipe = { wipePending = true },
                     onBiometricUnlock = { report ->
                         BiometricVault.unlock(
@@ -269,8 +306,12 @@ private fun SecNoteApp(activity: MainActivity) {
                                         Vault.ensureSaltWrapped(context, unlocked)
                                     }
                                     if (vaultReady) {
+                                        StorageGate.resumeAfterUnlock()
+                                        panicPasswordConfigured = PanicCredential.isConfigured(context)
+                                        hiddenVaultConfigured = HiddenVault.isConfigured(context)
                                         crypto = unlocked
                                     } else {
+                                        unlocked.destroy()
                                         report("Не удалось проверить ключ защищённого хранилища. Войдите по основному паролю.")
                                     }
                                 }
@@ -288,9 +329,10 @@ private fun SecNoteApp(activity: MainActivity) {
                     darkTheme = darkTheme,
                     biometricEnabled = biometricEnabled,
                     panicPasswordConfigured = panicPasswordConfigured,
+                    hiddenVaultConfigured = hiddenVaultConfigured,
                     screenshotBlockingEnabled = screenshotBlockingEnabled,
                     autoLockMinutes = autoLockMinutes,
-                    onLock = { crypto = null },
+                    onLock = lockMainVault,
                     onThemeChange = { enabled ->
                         darkTheme = enabled
                         AppPreferences.setDarkTheme(context, enabled)
@@ -304,6 +346,7 @@ private fun SecNoteApp(activity: MainActivity) {
                         AppPreferences.setAutoLockMinutes(context, minutes)
                     },
                     onPanicPasswordConfiguredChange = { panicPasswordConfigured = it },
+                    onHiddenVaultConfiguredChange = { hiddenVaultConfigured = it },
                     onBiometricChange = { enabled, report ->
                         if (enabled) {
                             BiometricVault.enable(
@@ -316,7 +359,7 @@ private fun SecNoteApp(activity: MainActivity) {
                                 onError = { message ->
                                     val lockAfterPrompt = activity.stoppedDuringTemporarySystemUi
                                     activity.stoppedDuringTemporarySystemUi = false
-                                    if (lockAfterPrompt) crypto = null
+                                    if (lockAfterPrompt) lockMainVault()
                                     report(message)
                                 }
                             )
@@ -329,6 +372,19 @@ private fun SecNoteApp(activity: MainActivity) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun LockingScreen() {
+    Column(
+        Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        CircularProgressIndicator()
+        Spacer(Modifier.height(14.dp))
+        Text("Блокировка защищённого хранилища")
     }
 }
 
@@ -595,6 +651,7 @@ private fun MainScreen(
     darkTheme: Boolean,
     biometricEnabled: Boolean,
     panicPasswordConfigured: Boolean,
+    hiddenVaultConfigured: Boolean,
     screenshotBlockingEnabled: Boolean,
     autoLockMinutes: Int,
     onLock: () -> Unit,
@@ -602,10 +659,96 @@ private fun MainScreen(
     onScreenshotBlockingChange: (Boolean) -> Unit,
     onAutoLockChange: (Int) -> Unit,
     onPanicPasswordConfiguredChange: (Boolean) -> Unit,
+    onHiddenVaultConfiguredChange: (Boolean) -> Unit,
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var page by remember { mutableStateOf(MainPage.NOTES) }
     var cameraVisible by remember { mutableStateOf(false) }
+    var hiddenCrypto by remember { mutableStateOf<Crypto?>(null) }
+    var showHiddenUnlock by remember { mutableStateOf(false) }
+    var hiddenPassword by remember { mutableStateOf("") }
+    var hiddenPasswordError by remember { mutableStateOf<String?>(null) }
+    var hiddenUnlockBusy by remember { mutableStateOf(false) }
+
+    // The additional store key is session-only and is destroyed whenever this area closes.
+    DisposableEffect(hiddenCrypto) {
+        onDispose { hiddenCrypto?.destroy() }
+    }
+
+    if (showHiddenUnlock) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!hiddenUnlockBusy) {
+                    showHiddenUnlock = false
+                    hiddenPassword = ""
+                    hiddenPasswordError = null
+                }
+            },
+            title = { Text("Введите пароль") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = hiddenPassword,
+                        onValueChange = { hiddenPassword = it; hiddenPasswordError = null },
+                        label = { Text("Пароль") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !hiddenUnlockBusy
+                    )
+                    if (hiddenPasswordError != null) {
+                        Text(hiddenPasswordError!!, color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !hiddenUnlockBusy && hiddenPassword.isNotEmpty(),
+                    onClick = {
+                        hiddenUnlockBusy = true
+                        val suppliedPassword = hiddenPassword
+                        hiddenPassword = ""
+                        scope.launch {
+                            val result = withContext(Dispatchers.Default) {
+                                HiddenVault.unlock(context, suppliedPassword)
+                            }
+                            hiddenUnlockBusy = false
+                            if (result == null) {
+                                hiddenPasswordError = "Неверный пароль или хранилище повреждено."
+                            } else if (lockCleanupPending || StorageGate.isBlocked()) {
+                                result.destroy()
+                            } else {
+                                hiddenCrypto = result
+                                showHiddenUnlock = false
+                                hiddenPasswordError = null
+                            }
+                        }
+                    }
+                ) { if (hiddenUnlockBusy) Text("Проверка…") else Text("Открыть") }
+            },
+            dismissButton = {
+                TextButton(enabled = !hiddenUnlockBusy, onClick = {
+                    showHiddenUnlock = false
+                    hiddenPassword = ""
+                    hiddenPasswordError = null
+                }) { Text("Отмена") }
+            }
+        )
+    }
+
+    if (hiddenCrypto != null) {
+        FileVaultScreen(
+            activity = activity,
+            crypto = hiddenCrypto!!,
+            onBack = { hiddenCrypto = null },
+            onLock = onLock,
+            storageDirectoryName = HiddenVault.DIRECTORY_NAME
+        )
+        return
+    }
     BackHandler(enabled = cameraVisible || page != MainPage.NOTES) {
         if (cameraVisible) cameraVisible = false else page = MainPage.NOTES
     }
@@ -622,7 +765,14 @@ private fun MainScreen(
             onOpenFiles = { page = MainPage.FILES },
             onOpenSettings = { page = MainPage.SETTINGS },
             onOpenCamera = { cameraVisible = true },
-            onLock = onLock
+            onLock = onLock,
+            onHiddenVaultRequest = {
+                if (hiddenVaultConfigured) {
+                    hiddenPassword = ""
+                    hiddenPasswordError = null
+                    showHiddenUnlock = true
+                }
+            }
         )
         MainPage.FILES -> FileVaultScreen(
             activity = activity,
@@ -634,12 +784,14 @@ private fun MainScreen(
             darkTheme = darkTheme,
             biometricEnabled = biometricEnabled,
             panicPasswordConfigured = panicPasswordConfigured,
+            hiddenVaultConfigured = hiddenVaultConfigured,
             screenshotBlockingEnabled = screenshotBlockingEnabled,
             autoLockMinutes = autoLockMinutes,
             onThemeChange = onThemeChange,
             onScreenshotBlockingChange = onScreenshotBlockingChange,
             onAutoLockChange = onAutoLockChange,
             onPanicPasswordConfiguredChange = onPanicPasswordConfiguredChange,
+            onHiddenVaultConfiguredChange = onHiddenVaultConfiguredChange,
             onBiometricChange = onBiometricChange,
             onBack = { page = MainPage.NOTES }
         )
@@ -652,7 +804,8 @@ private fun NotesHomeScreen(
     onOpenFiles: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenCamera: () -> Unit,
-    onLock: () -> Unit
+    onLock: () -> Unit,
+    onHiddenVaultRequest: () -> Unit
 ) {
     val context = LocalContext.current
     val repository = remember(crypto) { NoteRepository(context, crypto) }
@@ -718,7 +871,8 @@ private fun NotesHomeScreen(
             onOpenFiles = onOpenFiles,
             onOpenSettings = onOpenSettings,
             onOpenCamera = onOpenCamera,
-            onLock = onLock
+            onLock = onLock,
+            onHiddenVaultRequest = onHiddenVaultRequest
         )
     }
 }
@@ -734,13 +888,16 @@ private fun NotesListScreen(
     onOpenFiles: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenCamera: () -> Unit,
-    onLock: () -> Unit
+    onLock: () -> Unit,
+    onHiddenVaultRequest: () -> Unit
 ) {
     var showCreateDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     var draggedId by remember { mutableStateOf<String?>(null) }
     var dragOffset by remember { mutableStateOf(0f) }
     val reorderCallback by rememberUpdatedState(onReorder)
+    val lockCallback by rememberUpdatedState(onLock)
+    val hiddenVaultCallback by rememberUpdatedState(onHiddenVaultRequest)
 
     if (showCreateDialog) {
         AlertDialog(
@@ -782,9 +939,26 @@ private fun NotesListScreen(
                     IconButton(onClick = onOpenFiles) {
                         Icon(Icons.Default.FolderOpen, contentDescription = "Зашифрованные файлы")
                     }
-                    IconButton(onClick = onLock) {
-                        Icon(Icons.Default.Lock, contentDescription = "Заблокировать")
-                    }
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = "Заблокировать",
+                        modifier = Modifier
+                            .size(48.dp)
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                    val releasedBeforeTimeout = kotlinx.coroutines.withTimeoutOrNull(5_000L) {
+                                        waitForUpOrCancellation() != null
+                                    }
+                                    when (releasedBeforeTimeout) {
+                                        null -> hiddenVaultCallback()
+                                        true -> lockCallback()
+                                        false -> Unit // cancelled touch; do not activate either action
+                                    }
+                                }
+                            }
+                            .padding(12.dp)
+                    )
                 }
             )
         },
@@ -1205,12 +1379,14 @@ private fun SettingsScreen(
     darkTheme: Boolean,
     biometricEnabled: Boolean,
     panicPasswordConfigured: Boolean,
+    hiddenVaultConfigured: Boolean,
     screenshotBlockingEnabled: Boolean,
     autoLockMinutes: Int,
     onThemeChange: (Boolean) -> Unit,
     onScreenshotBlockingChange: (Boolean) -> Unit,
     onAutoLockChange: (Int) -> Unit,
     onPanicPasswordConfiguredChange: (Boolean) -> Unit,
+    onHiddenVaultConfiguredChange: (Boolean) -> Unit,
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit,
     onBack: () -> Unit
 ) {
@@ -1225,7 +1401,108 @@ private fun SettingsScreen(
     var repeatedPanicPassword by remember { mutableStateOf("") }
     var panicBusy by remember { mutableStateOf(false) }
     var panicError by remember { mutableStateOf<String?>(null) }
+    var showHiddenSetupDialog by remember { mutableStateOf(false) }
+    var hiddenPassword by remember { mutableStateOf("") }
+    var repeatedHiddenPassword by remember { mutableStateOf("") }
+    var hiddenSetupBusy by remember { mutableStateOf(false) }
+    var hiddenSetupError by remember { mutableStateOf<String?>(null) }
     val biometricAvailable = biometricStatus == androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
+
+    if (showHiddenSetupDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!hiddenSetupBusy) {
+                    showHiddenSetupDialog = false
+                    hiddenPassword = ""
+                    repeatedHiddenPassword = ""
+                    hiddenSetupError = null
+                }
+            },
+            title = { Text("Отдельный пароль") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Пароль не сохраняется в приложении и не может быть восстановлен. Используйте уникальную фразу длиной не менее 12 символов. Биометрический вход для этой области не применяется.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = hiddenPassword,
+                        onValueChange = { hiddenPassword = it; hiddenSetupError = null },
+                        label = { Text("Новый пароль (от 12 символов)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !hiddenSetupBusy
+                    )
+                    OutlinedTextField(
+                        value = repeatedHiddenPassword,
+                        onValueChange = { repeatedHiddenPassword = it; hiddenSetupError = null },
+                        label = { Text("Повторите пароль") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !hiddenSetupBusy
+                    )
+                    if (hiddenSetupError != null) {
+                        Text(hiddenSetupError!!, color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !hiddenSetupBusy && hiddenPassword.length >= 12 && hiddenPassword == repeatedHiddenPassword,
+                    onClick = {
+                        hiddenSetupBusy = true
+                        val passphrase = hiddenPassword
+                        hiddenPassword = ""
+                        repeatedHiddenPassword = ""
+                        scope.launch {
+                            val conflictCheck = withContext(Dispatchers.Default) {
+                                runCatching {
+                                    val generation = StorageGate.currentGeneration()
+                                    StorageGate.withAccess(generation) {
+                                        val primaryKey = Vault.unlock(context, passphrase)
+                                        val matchesPrimary = primaryKey != null
+                                        primaryKey?.destroy()
+                                        matchesPrimary || PanicCredential.verify(context, passphrase)
+                                    }
+                                }
+                            }
+                            val result: Result<Unit> = when {
+                                conflictCheck.isFailure -> Result.failure(
+                                    conflictCheck.exceptionOrNull() ?: IllegalStateException("Хранилище занято")
+                                )
+                                conflictCheck.getOrThrow() -> Result.failure(
+                                    IllegalArgumentException("Используйте пароль, отличный от основного и аварийного.")
+                                )
+                                else -> withContext(Dispatchers.IO) {
+                                    runCatching { HiddenVault.configure(context, passphrase) }
+                                }
+                            }
+                            hiddenSetupBusy = false
+                            result.onSuccess {
+                                onHiddenVaultConfiguredChange(true)
+                                showHiddenSetupDialog = false
+                                message = "Дополнительное файловое хранилище настроено. Пароль хранится только в вашей памяти."
+                            }.onFailure { error ->
+                                hiddenSetupError = error.message ?: "Не удалось настроить хранилище."
+                            }
+                        }
+                    }
+                ) { if (hiddenSetupBusy) Text("Создание…") else Text("Создать") }
+            },
+            dismissButton = {
+                TextButton(enabled = !hiddenSetupBusy, onClick = {
+                    showHiddenSetupDialog = false
+                    hiddenPassword = ""
+                    repeatedHiddenPassword = ""
+                    hiddenSetupError = null
+                }) { Text("Отмена") }
+            }
+        )
+    }
 
     if (showPanicDialog) {
         AlertDialog(
@@ -1241,7 +1518,7 @@ private fun SettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        "Этот пароль вводится в то же поле, что и основной. При его вводе SecNote покажет «Попытки исчерпаны» и без подтверждения начнёт необратимую очистку локального хранилища.",
+                        "Этот пароль вводится в то же поле, что и основной. При его вводе SecNote покажет «Попытки исчерпаны» и без подтверждения начнёт необратимое уничтожение всех локальных данных и ключей.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1282,12 +1559,25 @@ private fun SettingsScreen(
                                 testCrypto?.destroy()
                                 matchesPrimary
                             }
+                            val isHiddenPassword = if (isPrimaryPassword) false else {
+                                withContext(Dispatchers.Default) {
+                                    HiddenVault.matchesPassphrase(context, panicPassword)
+                                }
+                            }
                             if (isPrimaryPassword) {
                                 panicError = "Секретный пароль должен отличаться от основного."
                                 panicBusy = false
+                            } else if (isHiddenPassword) {
+                                panicError = "Секретный пароль должен отличаться от пароля дополнительного хранилища."
+                                panicBusy = false
                             } else {
                                 val saved = withContext(Dispatchers.IO) {
-                                    runCatching { PanicCredential.set(context, panicPassword) }
+                                    runCatching {
+                                        val generation = StorageGate.currentGeneration()
+                                        StorageGate.withAccess(generation) {
+                                            PanicCredential.set(context, panicPassword)
+                                        }
+                                    }
                                 }
                                 panicBusy = false
                                 saved.onSuccess {
@@ -1352,7 +1642,7 @@ private fun SettingsScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("SecNote · версия 1.4.5", style = MaterialTheme.typography.labelMedium,
+            Text("SecNote · версия 1.4.6", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Пакет: infernics.notes", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1379,6 +1669,20 @@ private fun SettingsScreen(
             Spacer(Modifier.height(26.dp))
             Text("Безопасность", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
+            SettingRow(
+                title = "Дополнительное файловое хранилище",
+                subtitle = if (hiddenVaultConfigured)
+                    "Настроено. Используется отдельный пароль без биометрического входа."
+                else "Можно создать отдельную область с независимым паролем."
+            ) {
+                if (hiddenVaultConfigured) {
+                    Text("Настроено", color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelMedium)
+                } else {
+                    TextButton(onClick = { showHiddenSetupDialog = true }) { Text("Настроить") }
+                }
+            }
+            Spacer(Modifier.height(18.dp))
             SettingRow(
                 title = "Вход по отпечатку",
                 subtitle = when {
@@ -1408,7 +1712,7 @@ private fun SettingsScreen(
             SettingRow(
                 title = "Секретный пароль уничтожения",
                 subtitle = if (panicConfigured)
-                    "Установлен. Ввод на экране блокировки запускает необратимую очистку."
+                    "Установлен. Ввод на экране блокировки уничтожает все локальные хранилища и ключи."
                 else "Не установлен. При необходимости задайте отдельный пароль."
             ) {
                 TextButton(onClick = { showPanicDialog = true }) {
@@ -1507,11 +1811,14 @@ private fun FileVaultScreen(
     activity: MainActivity,
     crypto: Crypto,
     onBack: () -> Unit,
-    onLock: () -> Unit
+    onLock: () -> Unit,
+    storageDirectoryName: String = "file_vault"
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val repository = remember(crypto) { FileVaultRepository(context, crypto) }
+    val repository = remember(crypto, storageDirectoryName) {
+        FileVaultRepository(context, crypto, storageDirectoryName)
+    }
     var files by remember { mutableStateOf<List<VaultFile>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
@@ -1523,6 +1830,15 @@ private fun FileVaultScreen(
     var selectionMode by remember { mutableStateOf(false) }
     var confirmBatchDelete by remember { mutableStateOf(false) }
     var pendingBatchExportIds by remember { mutableStateOf<List<String>>(emptyList()) }
+
+    BackHandler {
+        if (selectionMode) {
+            selectedIds = emptySet()
+            selectionMode = false
+        } else {
+            onBack()
+        }
+    }
 
     suspend fun reload() {
         files = withContext(Dispatchers.IO) { repository.loadAll() }
@@ -1896,6 +2212,9 @@ private fun VaultImageTile(
     ) {
         value = withContext(Dispatchers.IO) { repository.loadThumbnail(item.id, 420) }
     }
+    DisposableEffect(thumbnail) {
+        onDispose { thumbnail?.let { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() } }
+    }
 
     Card(
         modifier = modifier.combinedClickable(
@@ -2023,6 +2342,9 @@ private fun VaultImagePreviewDialog(
         repository
     ) {
         value = withContext(Dispatchers.IO) { repository.loadThumbnail(item.id, 1800) }
+    }
+    DisposableEffect(bitmap) {
+        onDispose { bitmap?.let { image -> if (!image.isRecycled) image.recycle() } }
     }
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Surface(

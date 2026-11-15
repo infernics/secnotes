@@ -47,12 +47,15 @@ object StorageGate {
         }
     }
 
-    /** Called only after a completely new vault has been created successfully. */
-    fun resumeAfterNewVault() {
+    /** Called after a locked existing vault has been authenticated again. */
+    fun resumeAfterUnlock() {
         lock.write {
             blocked = false
         }
     }
+
+    /** Called only after a completely new vault has been created successfully. */
+    fun resumeAfterNewVault() = resumeAfterUnlock()
 
     fun isBlocked(): Boolean = blocked
 }

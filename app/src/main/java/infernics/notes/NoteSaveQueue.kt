@@ -28,4 +28,9 @@ object NoteSaveQueue {
     fun reorder(repository: NoteRepository, orderedNotes: List<Note>) {
         scope.launch { runCatching { repository.reorder(orderedNotes) } }
     }
+
+    /** Places a barrier after all queued saves/deletes/reorders. */
+    suspend fun awaitIdle() {
+        withContext(dispatcher) { Unit }
+    }
 }

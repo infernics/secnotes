@@ -88,4 +88,23 @@ class CryptoTest {
         }
     }
 
+    @Test
+    fun emergencyDestroyClearsEveryLiveSessionKey() {
+        val first = Crypto.fromRawKeyBytes(ByteArray(32) { 0x11 })
+        val second = Crypto.fromRawKeyBytes(ByteArray(32) { 0x22 })
+        val firstBlob = first.encrypt("primary")
+        val secondBlob = second.encrypt("hidden")
+
+        Crypto.destroyAll()
+
+        try {
+            first.decryptToText(firstBlob)
+            fail("Emergency cleanup must destroy the primary content key")
+        } catch (_: Exception) { }
+        try {
+            second.decryptToText(secondBlob)
+            fail("Emergency cleanup must destroy the hidden content key")
+        } catch (_: Exception) { }
+    }
+
 }
