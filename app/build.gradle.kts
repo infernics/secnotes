@@ -11,8 +11,8 @@ android {
         applicationId = "infernics.notes"
         minSdk = 26
         targetSdk = 34
-        versionCode = 18
-        versionName = "1.4.10"
+        versionCode = 19
+        versionName = "1.4.11"
     }
 
     signingConfigs {

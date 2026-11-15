@@ -118,9 +118,14 @@ class MainActivity : FragmentActivity() {
     // File/document pickers are user-driven workflows and must not force an unlock
     // when Android returns the Activity. Biometric prompt keeps its existing policy.
     @Volatile var preserveSessionOnTemporaryUiReturn: Boolean = false
+    @Volatile var backupOperationInProgress: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Roll back an interrupted encrypted-backup import before exposing the unlock screen.
+        check(BackupManager.recoverInterruptedRestore(this)) {
+            "Не удалось восстановить прежнее состояние после прерванного импорта резервной копии."
+        }
         // Clear plaintext previews/exports left behind if Android killed a prior operation.
         runCatching { FileVaultRepository.cleanupAbandonedTemporaryFiles(this) }
         if (AppPreferences.isScreenshotBlockingEnabled(this)) {
@@ -211,11 +216,12 @@ private fun SecNoteApp(activity: MainActivity) {
                         backgroundAtElapsed = SystemClock.elapsedRealtime()
                         pendingLockJob?.cancel()
                         when {
-                            AutoLockPolicy.shouldLockImmediately(autoLockMinutes) -> lockMainVault()
+                            AutoLockPolicy.shouldLockImmediately(autoLockMinutes) && !activity.backupOperationInProgress -> lockMainVault()
                             autoLockMinutes > 0 -> {
                                 pendingLockJob = appScope.launch {
                                     delay(timeoutMs)
-                                    if (backgroundAtElapsed != 0L && !activity.allowTemporarySystemUi) {
+                                    if (backgroundAtElapsed != 0L && !activity.allowTemporarySystemUi &&
+                                        !activity.backupOperationInProgress) {
                                         lockMainVault()
                                     }
                                 }
@@ -237,11 +243,12 @@ private fun SecNoteApp(activity: MainActivity) {
                         activity.preserveSessionOnTemporaryUiReturn = false
                         backgroundAtElapsed = 0L
                         pendingLockJob?.cancel()
-                        if (!preserveSession) lockMainVault()
+                        if (!preserveSession && !activity.backupOperationInProgress) lockMainVault()
                     } else if (backgroundAtElapsed != 0L) {
                         pendingLockJob?.cancel()
                         val elapsed = SystemClock.elapsedRealtime() - backgroundAtElapsed
-                        if (AutoLockPolicy.shouldLockAfterBackground(autoLockMinutes, elapsed)) lockMainVault()
+                        if (!activity.backupOperationInProgress &&
+                            AutoLockPolicy.shouldLockAfterBackground(autoLockMinutes, elapsed)) lockMainVault()
                         backgroundAtElapsed = 0L
                     }
                 }
@@ -349,6 +356,16 @@ private fun SecNoteApp(activity: MainActivity) {
                     },
                     onPanicPasswordConfiguredChange = { panicPasswordConfigured = it },
                     onHiddenVaultConfiguredChange = { hiddenVaultConfigured = it },
+                    onBackupRestored = { restored ->
+                        crypto = restored.crypto
+                        darkTheme = restored.settings.darkTheme
+                        screenshotBlockingEnabled = restored.settings.screenshotBlocking
+                        autoLockMinutes = restored.settings.autoLockMinutes
+                        hiddenVaultConfigured = restored.hiddenVaultConfigured
+                        panicPasswordConfigured = restored.panicPasswordConfigured
+                        biometricEnabled = false
+                    },
+                    onBackupSessionRecovered = { recovered -> crypto = recovered },
                     onBiometricChange = { enabled, report ->
                         if (enabled) {
                             BiometricVault.enable(
@@ -663,6 +680,8 @@ private fun MainScreen(
     onAutoLockChange: (Int) -> Unit,
     onPanicPasswordConfiguredChange: (Boolean) -> Unit,
     onHiddenVaultConfiguredChange: (Boolean) -> Unit,
+    onBackupRestored: (BackupRestoreResult) -> Unit,
+    onBackupSessionRecovered: (Crypto) -> Unit,
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit
 ) {
     val context = LocalContext.current
@@ -801,6 +820,10 @@ private fun MainScreen(
             onOpenCamera = { cameraVisible = true }
         )
         MainPage.SETTINGS -> SettingsScreen(
+            activity = activity,
+            crypto = crypto,
+            onBackupRestored = onBackupRestored,
+            onBackupSessionRecovered = onBackupSessionRecovered,
             darkTheme = darkTheme,
             biometricEnabled = biometricEnabled,
             panicPasswordConfigured = panicPasswordConfigured,
@@ -1399,6 +1422,10 @@ private fun InlineChecklistRow(
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsScreen(
+    activity: MainActivity,
+    crypto: Crypto,
+    onBackupRestored: (BackupRestoreResult) -> Unit,
+    onBackupSessionRecovered: (Crypto) -> Unit,
     darkTheme: Boolean,
     biometricEnabled: Boolean,
     panicPasswordConfigured: Boolean,
@@ -1429,7 +1456,201 @@ private fun SettingsScreen(
     var repeatedHiddenPassword by remember { mutableStateOf("") }
     var hiddenSetupBusy by remember { mutableStateOf(false) }
     var hiddenSetupError by remember { mutableStateOf<String?>(null) }
+    var showBackupExportDialog by remember { mutableStateOf(false) }
+    var showBackupImportDialog by remember { mutableStateOf(false) }
+    var backupExportPassword by remember { mutableStateOf("") }
+    var backupExportRepeat by remember { mutableStateOf("") }
+    var backupImportPassword by remember { mutableStateOf("") }
+    var backupSourceMainPassword by remember { mutableStateOf("") }
+    var pendingExportPassword by remember { mutableStateOf<String?>(null) }
+    var pendingBackupUri by remember { mutableStateOf<Uri?>(null) }
+    var backupBusy by remember { mutableStateOf(false) }
+    val currentCrypto by rememberUpdatedState(crypto)
+
+    // A restore may replace and destroy the active content key. Keep this screen alive
+    // until its transaction has either committed or rolled back and the parent state updates.
+    BackHandler(enabled = backupBusy) { }
+
+    val backupExportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        activity.allowTemporarySystemUi = false
+        activity.preserveSessionOnTemporaryUiReturn = false
+        activity.stoppedDuringTemporarySystemUi = false
+        val password = pendingExportPassword
+        pendingExportPassword = null
+        if (uri != null && password != null) {
+            backupBusy = true
+            activity.backupOperationInProgress = true
+            scope.launch {
+                try {
+                    val result = runCatching {
+                        NoteSaveQueue.awaitIdle()
+                        withContext(Dispatchers.IO) {
+                            BackupManager.exportBackup(context, currentCrypto, password, uri)
+                        }
+                    }
+                    password.toCharArray().fill('\u0000')
+                    message = result.fold(
+                        onSuccess = { "Зашифрованная резервная копия создана." },
+                        onFailure = { "Не удалось создать резервную копию: ${it.message ?: "ошибка"}" }
+                    )
+                } finally {
+                    activity.backupOperationInProgress = false
+                    backupBusy = false
+                    password.toCharArray().fill('\u0000')
+                }
+            }
+        } else if (password != null) {
+            password.toCharArray().fill('\u0000')
+            message = "Создание резервной копии отменено."
+        }
+    }
+    val backupImportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        activity.allowTemporarySystemUi = false
+        activity.preserveSessionOnTemporaryUiReturn = false
+        activity.stoppedDuringTemporarySystemUi = false
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            pendingBackupUri = uri
+            backupImportPassword = ""
+            backupSourceMainPassword = ""
+            showBackupImportDialog = true
+        }
+    }
     val biometricAvailable = biometricStatus == androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
+
+    if (showBackupExportDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!backupBusy) { showBackupExportDialog = false; backupExportPassword = ""; backupExportRepeat = "" } },
+            title = { Text("Создать резервную копию") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Архив включает заметки, файлы и фотографии основного и дополнительного хранилищ, а также настройки. Он защищён отдельным паролем не короче 12 символов, который не должен совпадать с основным, дополнительным или секретным паролем уничтожения. Пароль дополнительного хранилища в архив не записывается — после переноса потребуется тот же пароль, который вы помните.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = backupExportPassword,
+                        onValueChange = { backupExportPassword = it },
+                        label = { Text("Пароль резервной копии") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !backupBusy
+                    )
+                    OutlinedTextField(
+                        value = backupExportRepeat,
+                        onValueChange = { backupExportRepeat = it },
+                        label = { Text("Повторите пароль") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !backupBusy
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !backupBusy && backupExportPassword.length >= 12 && backupExportPassword == backupExportRepeat,
+                    onClick = {
+                        pendingExportPassword = backupExportPassword
+                        backupExportPassword = ""
+                        backupExportRepeat = ""
+                        showBackupExportDialog = false
+                        val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+                        activity.allowTemporarySystemUi = true
+                        activity.preserveSessionOnTemporaryUiReturn = true
+                        backupExportLauncher.launch("SecNote-backup-$stamp.snb")
+                    }
+                ) { Text("Продолжить") }
+            },
+            dismissButton = {
+                TextButton(enabled = !backupBusy, onClick = {
+                    showBackupExportDialog = false
+                    backupExportPassword = ""
+                    backupExportRepeat = ""
+                }) { Text("Отмена") }
+            }
+        )
+    }
+
+    if (showBackupImportDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!backupBusy) { showBackupImportDialog = false; backupImportPassword = ""; backupSourceMainPassword = ""; pendingBackupUri = null } },
+            title = { Text("Восстановить резервную копию") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Сначала проверяются пароль архива и целостность всех файлов. Затем данные текущего приложения заменяются содержимым копии. Введите отдельный пароль архива и основной пароль, действовавший при создании копии. Пароль дополнительного хранилища не переносится и не требуется для импорта, но останется прежним — он понадобится для последующего открытия этого хранилища. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = backupImportPassword,
+                        onValueChange = { backupImportPassword = it },
+                        label = { Text("Пароль резервной копии") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !backupBusy
+                    )
+                    OutlinedTextField(
+                        value = backupSourceMainPassword,
+                        onValueChange = { backupSourceMainPassword = it },
+                        label = { Text("Основной пароль из копии") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !backupBusy
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !backupBusy && backupImportPassword.length >= 12 && backupSourceMainPassword.length >= 8 && pendingBackupUri != null,
+                    onClick = {
+                        val uri = pendingBackupUri ?: return@TextButton
+                        val backupPassword = backupImportPassword
+                        val mainPassword = backupSourceMainPassword
+                        backupImportPassword = ""
+                        backupSourceMainPassword = ""
+                        backupBusy = true
+                        activity.backupOperationInProgress = true
+                        scope.launch {
+                            try {
+                                val result = runCatching {
+                                    NoteSaveQueue.awaitIdle()
+                                    withContext(Dispatchers.IO) {
+                                        BackupManager.restoreBackup(context, currentCrypto, uri, backupPassword, mainPassword)
+                                    }
+                                }
+                                showBackupImportDialog = false
+                                pendingBackupUri = null
+                                result.onSuccess { restored ->
+                                    onBackupRestored(restored)
+                                    message = "Резервная копия восстановлена. Биометрию можно включить заново на этом устройстве."
+                                }.onFailure { error ->
+                                    (error as? BackupRestoreException)?.recoveredSessionCrypto?.let(onBackupSessionRecovered)
+                                    message = "Не удалось восстановить резервную копию: ${error.message ?: "ошибка"}"
+                                }
+                            } finally {
+                                backupPassword.toCharArray().fill('\u0000')
+                                mainPassword.toCharArray().fill('\u0000')
+                                activity.backupOperationInProgress = false
+                                backupBusy = false
+                            }
+                        }
+                    }
+                ) { if (backupBusy) Text("Проверка…") else Text("Проверить и восстановить") }
+            },
+            dismissButton = {
+                TextButton(enabled = !backupBusy, onClick = {
+                    showBackupImportDialog = false
+                    backupImportPassword = ""
+                    backupSourceMainPassword = ""
+                    pendingBackupUri = null
+                }) { Text("Отмена") }
+            }
+        )
+    }
 
     if (showHiddenSetupDialog) {
         AlertDialog(
@@ -1657,7 +1878,7 @@ private fun SettingsScreen(
             TopAppBar(
                 title = { Text("Настройки") },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = onBack, enabled = !backupBusy) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
                     }
                 }
@@ -1665,7 +1886,7 @@ private fun SettingsScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("SecNote · версия 1.4.6", style = MaterialTheme.typography.labelMedium,
+            Text("SecNote · версия 1.4.11", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Пакет: infernics.notes", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1780,6 +2001,38 @@ private fun SettingsScreen(
                         onClick = { onAutoLockChange(minutes) },
                         label = { Text(label) }
                     )
+                }
+            }
+            Spacer(Modifier.height(25.dp))
+            Text("Резервное копирование", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Создайте переносимый зашифрованный архив или восстановите данные из копии на этом устройстве. Архив защищён отдельным паролем; для восстановления также потребуется исходный основной пароль.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = { showBackupExportDialog = true },
+                    enabled = !backupBusy,
+                    modifier = Modifier.weight(1f)
+                ) { Text("Экспорт") }
+                Button(
+                    onClick = {
+                        activity.allowTemporarySystemUi = true
+                        activity.preserveSessionOnTemporaryUiReturn = true
+                        backupImportLauncher.launch(arrayOf("application/octet-stream", "application/x-secnote-backup", "*/*"))
+                    },
+                    enabled = !backupBusy,
+                    modifier = Modifier.weight(1f)
+                ) { Text("Импорт") }
+            }
+            if (backupBusy) {
+                Spacer(Modifier.height(10.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Text("Обработка резервной копии…", style = MaterialTheme.typography.bodySmall)
                 }
             }
             Spacer(Modifier.height(25.dp))

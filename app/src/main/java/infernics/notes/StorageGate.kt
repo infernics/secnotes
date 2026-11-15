@@ -39,6 +39,20 @@ object StorageGate {
         }
     }
 
+    /** Runs a consistent multi-file operation while excluding every repository read/write.
+     * Unlike blockAndDrain, this does not advance the session generation.
+     */
+    fun <T> withExclusiveAccess(action: () -> T): T {
+        val writeLock = lock.writeLock()
+        writeLock.lock()
+        try {
+            check(!blocked) { "Локальное хранилище заблокировано для очистки" }
+            return action()
+        } finally {
+            writeLock.unlock()
+        }
+    }
+
     /** Blocks new accesses and waits until every active repository operation has exited. */
     fun blockAndDrain() {
         blocked = true

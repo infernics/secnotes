@@ -28,6 +28,41 @@ class CryptoTest {
     }
 
     @Test
+    fun portableBackupEnvelopeRoundTripsWithItsOwnPassword() {
+        val archivePlaintext = ByteArray(700_000) { ((it * 31) % 251).toByte() }
+        val backupPassword = "different backup phrase"
+        val backupSalt = Crypto.newSalt()
+        val backupCrypto = Crypto.fromPassphrase(backupPassword, backupSalt)
+        val encryptedBackup = ByteArrayOutputStream()
+        encryptedBackup.write("SCNBKUP1".toByteArray(Charsets.US_ASCII))
+        encryptedBackup.write(backupSalt)
+        backupCrypto.encryptStream(ByteArrayInputStream(archivePlaintext), encryptedBackup)
+
+        val encoded = encryptedBackup.toByteArray()
+        val headerSize = 8 + 16
+        assertArrayEquals("SCNBKUP1".toByteArray(Charsets.US_ASCII), encoded.copyOfRange(0, 8))
+        val importedSalt = encoded.copyOfRange(8, headerSize)
+        val importedCrypto = Crypto.fromPassphrase(backupPassword, importedSalt)
+        val restored = ByteArrayOutputStream()
+        importedCrypto.decryptStream(ByteArrayInputStream(encoded.copyOfRange(headerSize, encoded.size)), restored)
+        assertArrayEquals(archivePlaintext, restored.toByteArray())
+
+        val wrongPassword = Crypto.fromPassphrase("another backup phrase", importedSalt)
+        try {
+            wrongPassword.decryptStream(ByteArrayInputStream(encoded.copyOfRange(headerSize, encoded.size)), ByteArrayOutputStream())
+            fail("The backup must not decrypt with a different password")
+        } catch (_: Exception) {
+            // Expected: GCM authentication must reject a different backup key.
+        }
+        backupCrypto.destroy()
+        importedCrypto.destroy()
+        wrongPassword.destroy()
+        backupSalt.fill(0)
+        importedSalt.fill(0)
+        archivePlaintext.fill(0)
+    }
+
+    @Test
     fun jpegPayloadSurvivesVaultStreamingEncryption() {
         val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
         val original = ByteArray(384 * 1024) { (it % 251).toByte() }.also {

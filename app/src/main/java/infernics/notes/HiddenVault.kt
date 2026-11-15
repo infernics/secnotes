@@ -71,6 +71,12 @@ object HiddenVault {
         }
     }
 
+    internal fun isValidRecord(record: ByteArray): Boolean {
+        val expectedSize = 4 + SALT_LENGTH + 12 + VERIFIER.size + 16
+        if (record.size != expectedSize) return false
+        return runCatching { ByteBuffer.wrap(record).int == METADATA_MAGIC }.getOrDefault(false)
+    }
+
     /** Returns a session-only key on success; incorrect passwords produce no key. */
     fun unlock(context: Context, passphrase: String): Crypto? {
         if (passphrase.isEmpty()) return null

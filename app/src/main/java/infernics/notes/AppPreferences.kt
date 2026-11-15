@@ -33,6 +33,23 @@ object AppPreferences {
         preferences(context).edit().putInt(KEY_AUTO_LOCK_MINUTES, minutes).apply()
     }
 
+    internal fun backupSettings(context: Context): BackupSettings = BackupSettings(
+        darkTheme = isDarkTheme(context),
+        screenshotBlocking = isScreenshotBlockingEnabled(context),
+        autoLockMinutes = getAutoLockMinutes(context)
+    )
+
+    internal fun applyBackupSettings(context: Context, settings: BackupSettings) {
+        require(settings.autoLockMinutes in AutoLockPolicy.supportedMinutes)
+        check(
+            preferences(context).edit()
+                .putBoolean(KEY_DARK_THEME, settings.darkTheme)
+                .putBoolean(KEY_SCREENSHOT_BLOCKING, settings.screenshotBlocking)
+                .putInt(KEY_AUTO_LOCK_MINUTES, settings.autoLockMinutes)
+                .commit()
+        ) { "Не удалось восстановить настройки приложения." }
+    }
+
     fun reset(context: Context) {
         preferences(context).edit().clear().commit()
     }

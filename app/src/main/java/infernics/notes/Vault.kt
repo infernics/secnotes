@@ -143,6 +143,71 @@ object Vault {
         }
     }
 
+    @Synchronized
+    internal fun matchesPassphrase(context: Context, passphrase: String): Boolean {
+        var stored: ByteArray? = null
+        var salt: ByteArray? = null
+        var checkBlob: ByteArray? = null
+        var candidate: Crypto? = null
+        return try {
+            if (!isSetup(context)) return false
+            val storedBytes = saltFile(context).readBytes()
+            stored = storedBytes
+            val rawSalt = if (storedBytes.size == SALT_LENGTH) storedBytes.copyOf() else unwrapSalt(storedBytes)
+            salt = rawSalt
+            checkBlob = checkFile(context).readBytes()
+            val crypto = Crypto.fromPassphrase(passphrase, rawSalt)
+            candidate = crypto
+            crypto.decryptToText(checkBlob) == "verify"
+        } catch (_: Exception) {
+            false
+        } finally {
+            candidate?.destroy()
+            stored?.fill(0)
+            salt?.fill(0)
+            checkBlob?.fill(0)
+        }
+    }
+
+    /** Export the portable PBKDF2 salt only after the currently unlocked key verifies. */
+    @Synchronized
+    internal fun exportSaltForBackup(context: Context, crypto: Crypto): ByteArray {
+        var stored: ByteArray? = null
+        var salt: ByteArray? = null
+        var checkBlob: ByteArray? = null
+        return try {
+            check(File(context.filesDir, "key.check").isFile) { "Основное хранилище не настроено." }
+            val storedBytes = saltFile(context).readBytes()
+            stored = storedBytes
+            val rawSalt = if (storedBytes.size == SALT_LENGTH) storedBytes.copyOf() else unwrapSalt(storedBytes)
+            salt = rawSalt
+            check(rawSalt.size == SALT_LENGTH) { "Некорректная соль основного хранилища." }
+            val checkBytes = checkFile(context).readBytes()
+            checkBlob = checkBytes
+            require(crypto.decryptToText(checkBytes) == "verify") { "Ключ текущего хранилища не подтверждён." }
+            rawSalt.copyOf()
+        } finally {
+            stored?.fill(0)
+            salt?.fill(0)
+            checkBlob?.fill(0)
+        }
+    }
+
+    /** Install a portable salt on this device, re-wrapping it with this device's Keystore. */
+    @Synchronized
+    internal fun installPortableState(context: Context, salt: ByteArray, crypto: Crypto) {
+        require(salt.size == SALT_LENGTH) { "Некорректная соль резервной копии." }
+        val wrappedSalt = wrapSalt(salt)
+        val checkBlob = crypto.encrypt("verify")
+        try {
+            writeAtomically(saltFile(context), wrappedSalt)
+            writeAtomically(checkFile(context), checkBlob)
+        } finally {
+            wrappedSalt.fill(0)
+            checkBlob.fill(0)
+        }
+    }
+
     private fun wrapSalt(salt: ByteArray): ByteArray {
         require(salt.size == SALT_LENGTH)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")

@@ -40,4 +40,13 @@ class HiddenVaultTest {
         val modified = record.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() }
         assertNull(HiddenVault.unlockFromRecord("long-hidden-password-123", modified))
     }
+    @Test
+    fun portableVerifierRecordHasAnExactExpectedLength() {
+        val salt = ByteArray(16) { (it * 13 + 1).toByte() }
+        val record = HiddenVault.createRecord("portable-hidden-password-2026", salt)
+        assertTrue(HiddenVault.isValidRecord(record))
+        assertFalse(HiddenVault.isValidRecord(record.copyOf(record.size + 1)))
+        assertFalse(HiddenVault.isValidRecord(record.copyOf(record.size - 1)))
+    }
+
 }
