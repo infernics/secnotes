@@ -22,14 +22,14 @@ object AppPreferences {
         preferences(context).edit().putBoolean(KEY_SCREENSHOT_BLOCKING, enabled).apply()
     }
 
-    /** 0 = immediately, 1 = after one minute, 5 = after five minutes. */
+    /** -1 = never, 0 = immediately, positive values = minutes. */
     fun getAutoLockMinutes(context: Context): Int =
         preferences(context).getInt(KEY_AUTO_LOCK_MINUTES, 0).let { value ->
-            if (value in setOf(0, 1, 5)) value else 0
+            if (value in AutoLockPolicy.supportedMinutes) value else 0
         }
 
     fun setAutoLockMinutes(context: Context, minutes: Int) {
-        require(minutes in setOf(0, 1, 5))
+        require(minutes in AutoLockPolicy.supportedMinutes)
         preferences(context).edit().putInt(KEY_AUTO_LOCK_MINUTES, minutes).apply()
     }
 

@@ -27,6 +27,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -40,7 +42,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
@@ -168,7 +169,7 @@ private fun SecNoteApp(activity: MainActivity) {
     DisposableEffect(lifecycleOwner, autoLockMinutes) {
         var backgroundAtElapsed = 0L
         var pendingLockJob: Job? = null
-        val timeoutMs = autoLockMinutes.toLong() * 60_000L
+        val timeoutMs = AutoLockPolicy.timeoutMillis(autoLockMinutes)
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
@@ -177,15 +178,19 @@ private fun SecNoteApp(activity: MainActivity) {
                     } else {
                         backgroundAtElapsed = SystemClock.elapsedRealtime()
                         pendingLockJob?.cancel()
-                        if (timeoutMs == 0L) {
-                            crypto = null
-                        } else {
-                            pendingLockJob = appScope.launch {
-                                delay(timeoutMs)
-                                if (backgroundAtElapsed != 0L && !activity.allowTemporarySystemUi) {
-                                    crypto = null
+                        when {
+                            AutoLockPolicy.shouldLockImmediately(autoLockMinutes) -> crypto = null
+                            autoLockMinutes > 0 -> {
+                                pendingLockJob = appScope.launch {
+                                    delay(timeoutMs)
+                                    if (backgroundAtElapsed != 0L && !activity.allowTemporarySystemUi) {
+                                        crypto = null
+                                    }
                                 }
                             }
+                            // -1 means never lock just because the app is in the background.
+                            // If Android kills the process, the in-memory key is still lost.
+                            else -> Unit
                         }
                     }
                 }
@@ -204,7 +209,7 @@ private fun SecNoteApp(activity: MainActivity) {
                     } else if (backgroundAtElapsed != 0L) {
                         pendingLockJob?.cancel()
                         val elapsed = SystemClock.elapsedRealtime() - backgroundAtElapsed
-                        if (elapsed >= timeoutMs) crypto = null
+                        if (AutoLockPolicy.shouldLockAfterBackground(autoLockMinutes, elapsed)) crypto = null
                         backgroundAtElapsed = 0L
                     }
                 }
@@ -497,10 +502,28 @@ private fun LockScreen(
         Modifier.fillMaxSize().padding(28.dp),
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(34.dp))
+        IconButton(
+            onClick = { if (biometricEnabled) onBiometricUnlock { errorMessage = it } },
+            enabled = biometricEnabled && !busy,
+            modifier = Modifier.size(54.dp)
+        ) {
+            Icon(
+                Icons.Default.Lock,
+                contentDescription = if (biometricEnabled) "Разблокировать SecNote по биометрии" else "SecNote заблокирован",
+                modifier = Modifier.size(34.dp)
+            )
+        }
         Spacer(Modifier.height(14.dp))
         Text("SecNote", style = MaterialTheme.typography.headlineMedium)
         Text("infernics.ru", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (biometricEnabled) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Нажмите на замок для входа по биометрии",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
         Spacer(Modifier.height(28.dp))
         Text("Введите пароль", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(16.dp))
@@ -559,18 +582,6 @@ private fun LockScreen(
         ) {
             if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
             else Text("Разблокировать")
-        }
-        if (biometricEnabled) {
-            Spacer(Modifier.height(10.dp))
-            TextButton(
-                onClick = { onBiometricUnlock { errorMessage = it } },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !busy
-            ) {
-                Icon(Icons.Default.Fingerprint, contentDescription = null)
-                Spacer(Modifier.width(9.dp))
-                Text("Войти по отпечатку")
-            }
         }
     }
 }
@@ -698,13 +709,8 @@ private fun NotesHomeScreen(
             },
             onOpen = { editing = it; editingIsNew = false },
             onReorder = { fromId, toId ->
-                val fromIndex = notes.indexOfFirst { it.id == fromId }
-                val toIndex = notes.indexOfFirst { it.id == toId }
-                if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
-                    val reordered = notes.toMutableList().apply {
-                        val moving = removeAt(fromIndex)
-                        add(toIndex, moving)
-                    }
+                val reordered = swapNotePositions(notes, fromId, toId)
+                if (reordered !== notes) {
                     notes = reordered
                     NoteSaveQueue.reorder(repository, reordered)
                 }
@@ -1193,7 +1199,7 @@ private fun InlineChecklistRow(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun SettingsScreen(
     darkTheme: Boolean,
@@ -1346,7 +1352,7 @@ private fun SettingsScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("SecNote · версия 1.4.0", style = MaterialTheme.typography.labelMedium,
+            Text("SecNote · версия 1.4.5", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Пакет: infernics.notes", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1354,10 +1360,21 @@ private fun SettingsScreen(
             Text("Внешний вид", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             SettingRow(
-                title = "Тёмная тема",
-                subtitle = if (darkTheme) "Используется графитовая тема" else "Используется светлая нейтральная тема"
+                title = "Оформление",
+                subtitle = if (darkTheme) "Выбрана тёмная графитовая тема" else "Выбрана светлая нейтральная тема"
             ) {
-                Switch(checked = darkTheme, onCheckedChange = onThemeChange)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = !darkTheme,
+                        onClick = { onThemeChange(false) },
+                        label = { Text("Светлая") }
+                    )
+                    FilterChip(
+                        selected = darkTheme,
+                        onClick = { onThemeChange(true) },
+                        label = { Text("Тёмная") }
+                    )
+                }
             }
             Spacer(Modifier.height(26.dp))
             Text("Безопасность", style = MaterialTheme.typography.titleMedium)
@@ -1412,27 +1429,31 @@ private fun SettingsScreen(
             Text("Автоблокировка", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(6.dp))
             Text(
-                "После ухода приложения в фон доступ закроется по выбранному таймеру. Если Android завершит процесс, SecNote всегда будет заблокирован при следующем запуске.",
+                "Выберите задержку блокировки после сворачивания. При значении «Никогда» приложение останется открытым, пока Android не завершит его процесс; после перезапуска пароль потребуется снова.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                FilterChip(
-                    selected = autoLockMinutes == 0,
-                    onClick = { onAutoLockChange(0) },
-                    label = { Text("Мгновенно") }
-                )
-                FilterChip(
-                    selected = autoLockMinutes == 1,
-                    onClick = { onAutoLockChange(1) },
-                    label = { Text("1 мин") }
-                )
-                FilterChip(
-                    selected = autoLockMinutes == 5,
-                    onClick = { onAutoLockChange(5) },
-                    label = { Text("5 мин") }
-                )
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                listOf(
+                    -1 to "Никогда",
+                    0 to "Мгновенно",
+                    1 to "1 мин",
+                    5 to "5 мин",
+                    10 to "10 мин",
+                    15 to "15 мин",
+                    30 to "30 мин"
+                ).forEach { (minutes, label) ->
+                    FilterChip(
+                        selected = autoLockMinutes == minutes,
+                        onClick = { onAutoLockChange(minutes) },
+                        label = { Text(label) }
+                    )
+                }
             }
             Spacer(Modifier.height(25.dp))
             Text("Хранилище", style = MaterialTheme.typography.titleMedium)

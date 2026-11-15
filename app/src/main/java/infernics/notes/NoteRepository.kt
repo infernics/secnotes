@@ -27,6 +27,19 @@ data class Note(
     val sortOrder: Long = Long.MAX_VALUE
 )
 
+/** Returns a new list with two note positions exchanged; the original list is never mutated. */
+internal fun swapNotePositions(notes: List<Note>, draggedId: String, targetId: String): List<Note> {
+    val draggedIndex = notes.indexOfFirst { it.id == draggedId }
+    val targetIndex = notes.indexOfFirst { it.id == targetId }
+    if (draggedIndex < 0 || targetIndex < 0 || draggedIndex == targetIndex) return notes
+
+    return notes.toMutableList().apply {
+        val dragged = this[draggedIndex]
+        this[draggedIndex] = this[targetIndex]
+        this[targetIndex] = dragged
+    }
+}
+
 /** Each note is a separate AES-256-GCM encrypted JSON file in private app storage. */
 class NoteRepository(context: Context, private val crypto: Crypto) {
     private val generation = StorageGate.currentGeneration()
