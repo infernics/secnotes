@@ -87,6 +87,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -117,6 +118,34 @@ private fun SecNoteApp(activity: MainActivity) {
     var biometricEnabled by remember { mutableStateOf(BiometricVault.isEnabled(context)) }
     var screenshotBlockingEnabled by remember {
         mutableStateOf(AppPreferences.isScreenshotBlockingEnabled(context))
+    }
+    var panicPasswordConfigured by remember {
+        mutableStateOf(PanicCredential.isConfigured(context))
+    }
+    var wipePending by remember { mutableStateOf(EmergencyWipe.isPending(context)) }
+    var wipeFailed by remember { mutableStateOf(false) }
+    var wipeAttempt by remember { mutableStateOf(0) }
+
+    // The marker is written before the lockout message. If Android kills the process,
+    // the next launch resumes cleanup before showing either Unlock or Setup.
+    LaunchedEffect(wipePending, wipeAttempt) {
+        if (wipePending) {
+            val completed = withContext(Dispatchers.IO) {
+                runCatching { EmergencyWipe.complete(context) }.getOrDefault(false)
+            }
+            if (completed) {
+                crypto = null
+                needsSetup = true
+                biometricEnabled = false
+                panicPasswordConfigured = false
+                darkTheme = true
+                screenshotBlockingEnabled = false
+                wipeFailed = false
+                wipePending = false
+            } else {
+                wipeFailed = true
+            }
+        }
     }
 
     // Existing automatic lock: erase the in-memory vault key when the app goes to background.
@@ -168,36 +197,41 @@ private fun SecNoteApp(activity: MainActivity) {
         )
     ) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            val currentCrypto = crypto
-            if (currentCrypto == null) {
-                if (needsSetup) {
-                    SetupScreen(onCreated = {
-                        crypto = it
-                        needsSetup = false
-                    })
-                } else {
-                    LockScreen(
-                        biometricEnabled = biometricEnabled,
-                        onUnlocked = { crypto = it },
-                        onBiometricUnlock = { report ->
-                            BiometricVault.unlock(
-                                activity,
-                                onUnlocked = { unlocked -> crypto = unlocked },
-                                onError = { message ->
-                                    biometricEnabled = BiometricVault.isEnabled(context)
-                                    report(message)
-                                }
-                            )
-                        }
-                    )
-                }
-            } else {
-                MainScreen(
+            when {
+                wipePending -> EmergencyWipeScreen(
+                    failed = wipeFailed,
+                    onRetry = {
+                        wipeFailed = false
+                        wipeAttempt++
+                    }
+                )
+                crypto == null && needsSetup -> SetupScreen(onCreated = {
+                    crypto = it
+                    needsSetup = false
+                })
+                crypto == null -> LockScreen(
+                    biometricEnabled = biometricEnabled,
+                    onUnlocked = { crypto = it },
+                    onEmergencyWipe = { wipePending = true },
+                    onBiometricUnlock = { report ->
+                        BiometricVault.unlock(
+                            activity,
+                            onUnlocked = { unlocked -> crypto = unlocked },
+                            onError = { message ->
+                                biometricEnabled = BiometricVault.isEnabled(context)
+                                report(message)
+                            }
+                        )
+                    }
+                )
+                else -> MainScreen(
                     activity = activity,
-                    crypto = currentCrypto,
+                    crypto = crypto!!,
                     darkTheme = darkTheme,
                     biometricEnabled = biometricEnabled,
                     screenshotBlockingEnabled = screenshotBlockingEnabled,
+                    panicPasswordConfigured = panicPasswordConfigured,
+                    onPanicPasswordConfiguredChange = { panicPasswordConfigured = it },
                     onLock = { crypto = null },
                     onThemeChange = { enabled ->
                         darkTheme = enabled
@@ -211,7 +245,7 @@ private fun SecNoteApp(activity: MainActivity) {
                         if (enabled) {
                             BiometricVault.enable(
                                 activity,
-                                currentCrypto,
+                                crypto!!,
                                 onEnabled = {
                                     biometricEnabled = true
                                     report("Вход по биометрии включён.")
@@ -231,6 +265,32 @@ private fun SecNoteApp(activity: MainActivity) {
                     }
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun EmergencyWipeScreen(failed: Boolean, onRetry: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(38.dp))
+        Spacer(Modifier.height(18.dp))
+        Text("Попытки исчерпаны", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(10.dp))
+        if (failed) {
+            Text(
+                "Очистка ещё не завершена. SecNote заблокирован. Повторите операцию.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onRetry) { Text("Повторить очистку") }
+        } else {
+            CircularProgressIndicator()
+            Spacer(Modifier.height(10.dp))
+            Text("Выполняется очистка хранилища…", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -362,6 +422,7 @@ private fun SetupScreen(onCreated: (Crypto) -> Unit) {
 private fun LockScreen(
     biometricEnabled: Boolean,
     onUnlocked: (Crypto) -> Unit,
+    onEmergencyWipe: () -> Unit,
     onBiometricUnlock: ((String) -> Unit) -> Unit
 ) {
     val context = LocalContext.current
@@ -379,13 +440,14 @@ private fun LockScreen(
         Text("SecNote", style = MaterialTheme.typography.headlineMedium)
         Text("infernics.ru", color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(28.dp))
-        Text("Введите основной пароль", style = MaterialTheme.typography.titleLarge)
+        Text("Введите пароль", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(16.dp))
         OutlinedTextField(
             value = password,
             onValueChange = { password = it; errorMessage = null },
             label = { Text("Пароль") },
             singleLine = true,
+            enabled = !busy,
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             modifier = Modifier.fillMaxWidth()
@@ -397,25 +459,55 @@ private fun LockScreen(
         Spacer(Modifier.height(16.dp))
         Button(
             onClick = {
+                val enteredPassword = password
                 busy = true
+                errorMessage = null
                 scope.launch {
-                    val unlocked = withContext(Dispatchers.Default) { Vault.unlock(context, password) }
-                    busy = false
-                    if (unlocked == null) errorMessage = "Неверный пароль или повреждённое хранилище."
-                    else onUnlocked(unlocked)
+                    // Check the emergency credential before attempting normal unlock.
+                    val isEmergencyPassword = withContext(Dispatchers.Default) {
+                        PanicCredential.verify(context, enteredPassword)
+                    }
+                    if (isEmergencyPassword) {
+                        // Persist the marker before displaying the neutral lockout notice.
+                        // A process death during the short delay will still resume the wipe.
+                        val markerWritten = withContext(Dispatchers.IO) {
+                            runCatching { EmergencyWipe.markPending(context) }.isSuccess
+                        }
+                        if (!markerWritten) {
+                            errorMessage = "Не удалось начать защищённую очистку. Повторите попытку."
+                            busy = false
+                        } else {
+                            errorMessage = "Попытки исчерпаны"
+                            password = ""
+                            delay(1_100)
+                            onEmergencyWipe()
+                        }
+                    } else {
+                        val unlocked = withContext(Dispatchers.Default) {
+                            Vault.unlock(context, enteredPassword)
+                        }
+                        busy = false
+                        if (unlocked == null) {
+                            errorMessage = "Неверный пароль или повреждённое хранилище."
+                        } else {
+                            password = ""
+                            onUnlocked(unlocked)
+                        }
+                    }
                 }
             },
             enabled = !busy && password.isNotEmpty(),
             modifier = Modifier.fillMaxWidth()
         ) {
             if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-            else Text("Разблокировать паролем")
+            else Text("Разблокировать")
         }
         if (biometricEnabled) {
             Spacer(Modifier.height(10.dp))
             TextButton(
                 onClick = { onBiometricUnlock { errorMessage = it } },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
             ) {
                 Icon(Icons.Default.Fingerprint, contentDescription = null)
                 Spacer(Modifier.width(9.dp))
@@ -434,6 +526,8 @@ private fun MainScreen(
     darkTheme: Boolean,
     biometricEnabled: Boolean,
     screenshotBlockingEnabled: Boolean,
+    panicPasswordConfigured: Boolean,
+    onPanicPasswordConfiguredChange: (Boolean) -> Unit,
     onLock: () -> Unit,
     onThemeChange: (Boolean) -> Unit,
     onScreenshotBlockingChange: (Boolean) -> Unit,
@@ -459,6 +553,8 @@ private fun MainScreen(
             darkTheme = darkTheme,
             biometricEnabled = biometricEnabled,
             screenshotBlockingEnabled = screenshotBlockingEnabled,
+            panicPasswordConfigured = panicPasswordConfigured,
+            onPanicPasswordConfiguredChange = onPanicPasswordConfiguredChange,
             onThemeChange = onThemeChange,
             onScreenshotBlockingChange = onScreenshotBlockingChange,
             onBiometricChange = onBiometricChange,
@@ -907,15 +1003,141 @@ private fun SettingsScreen(
     darkTheme: Boolean,
     biometricEnabled: Boolean,
     screenshotBlockingEnabled: Boolean,
+    panicPasswordConfigured: Boolean,
+    onPanicPasswordConfiguredChange: (Boolean) -> Unit,
     onThemeChange: (Boolean) -> Unit,
     onScreenshotBlockingChange: (Boolean) -> Unit,
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val biometricStatus = remember { BiometricVault.canAuthenticate(context) }
     var message by remember { mutableStateOf<String?>(null) }
+    var panicConfigured by remember(panicPasswordConfigured) { mutableStateOf(panicPasswordConfigured) }
+    var showPanicDialog by remember { mutableStateOf(false) }
+    var showRemovePanicDialog by remember { mutableStateOf(false) }
+    var panicPassword by remember { mutableStateOf("") }
+    var repeatedPanicPassword by remember { mutableStateOf("") }
+    var panicBusy by remember { mutableStateOf(false) }
+    var panicError by remember { mutableStateOf<String?>(null) }
     val biometricAvailable = biometricStatus == androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
+
+    if (showPanicDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!panicBusy) {
+                    showPanicDialog = false
+                    panicPassword = ""
+                    repeatedPanicPassword = ""
+                    panicError = null
+                }
+            },
+            title = { Text(if (panicConfigured) "Изменить секретный пароль" else "Секретный пароль уничтожения") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Секретный пароль вводится в то же поле, что и основной. При его вводе SecNote покажет «Попытки исчерпаны» и без подтверждения начнёт необратимую очистку данных приложения.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = panicPassword,
+                        onValueChange = { panicPassword = it; panicError = null },
+                        label = { Text("Секретный пароль (не менее 8 символов)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !panicBusy
+                    )
+                    OutlinedTextField(
+                        value = repeatedPanicPassword,
+                        onValueChange = { repeatedPanicPassword = it; panicError = null },
+                        label = { Text("Повторите секретный пароль") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        enabled = !panicBusy
+                    )
+                    if (panicError != null) {
+                        Text(
+                            panicError!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !panicBusy && panicPassword.length >= 8 && panicPassword == repeatedPanicPassword,
+                    onClick = {
+                        panicBusy = true
+                        panicError = null
+                        scope.launch {
+                            val isPrimaryPassword = withContext(Dispatchers.Default) {
+                                Vault.unlock(context, panicPassword) != null
+                            }
+                            if (isPrimaryPassword) {
+                                panicError = "Секретный пароль должен отличаться от основного."
+                                panicBusy = false
+                            } else {
+                                val saved = withContext(Dispatchers.IO) {
+                                    runCatching { PanicCredential.set(context, panicPassword) }
+                                }
+                                panicBusy = false
+                                saved.onSuccess {
+                                    panicConfigured = true
+                                    onPanicPasswordConfiguredChange(true)
+                                    showPanicDialog = false
+                                    panicPassword = ""
+                                    repeatedPanicPassword = ""
+                                    message = "Секретный пароль уничтожения установлен."
+                                }.onFailure {
+                                    panicError = it.message ?: "Не удалось сохранить секретный пароль."
+                                }
+                            }
+                        }
+                    }
+                ) { if (panicBusy) Text("Сохранение…") else Text("Сохранить") }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !panicBusy,
+                    onClick = {
+                        showPanicDialog = false
+                        panicPassword = ""
+                        repeatedPanicPassword = ""
+                        panicError = null
+                    }
+                ) { Text("Отмена") }
+            }
+        )
+    }
+
+    if (showRemovePanicDialog) {
+        AlertDialog(
+            onDismissRequest = { showRemovePanicDialog = false },
+            title = { Text("Отключить самоуничтожение?") },
+            text = { Text("Секретный пароль будет удалён. Основной пароль и данные останутся без изменений.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val removed = PanicCredential.remove(context)
+                    if (removed) {
+                        panicConfigured = false
+                        onPanicPasswordConfiguredChange(false)
+                        showRemovePanicDialog = false
+                        message = "Секретный пароль уничтожения удалён."
+                    } else {
+                        message = "Не удалось удалить секретный пароль. Повторите попытку."
+                    }
+                }) { Text("Отключить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRemovePanicDialog = false }) { Text("Отмена") }
+            }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -930,7 +1152,7 @@ private fun SettingsScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("SecNote · версия 1.3", style = MaterialTheme.typography.labelMedium,
+            Text("SecNote · версия 1.3.3", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Пакет: infernics.notes", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -974,10 +1196,23 @@ private fun SettingsScreen(
                     "Снимки экрана и запись экрана заблокированы для окна приложения"
                 else "Снимки экрана разрешены"
             ) {
-                Switch(
-                    checked = screenshotBlockingEnabled,
-                    onCheckedChange = onScreenshotBlockingChange
-                )
+                Switch(checked = screenshotBlockingEnabled, onCheckedChange = onScreenshotBlockingChange)
+            }
+            Spacer(Modifier.height(18.dp))
+            SettingRow(
+                title = "Секретный пароль уничтожения",
+                subtitle = if (panicConfigured)
+                    "Установлен. Ввод на экране блокировки запускает необратимую очистку."
+                else "Не установлен. Задайте отдельный пароль для экстренного уничтожения данных."
+            ) {
+                TextButton(onClick = { showPanicDialog = true }) {
+                    Text(if (panicConfigured) "Изменить" else "Установить")
+                }
+            }
+            if (panicConfigured) {
+                TextButton(onClick = { showRemovePanicDialog = true }) {
+                    Text("Отключить секретный пароль")
+                }
             }
             Spacer(Modifier.height(25.dp))
             Text("Автоблокировка", style = MaterialTheme.typography.titleMedium)
