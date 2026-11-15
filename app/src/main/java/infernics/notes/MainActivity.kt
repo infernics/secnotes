@@ -11,9 +11,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.gestures.detectTapGestures
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
@@ -73,6 +71,7 @@ import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -92,6 +91,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.ViewConfiguration
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -944,26 +945,29 @@ private fun NotesListScreen(
                     IconButton(onClick = onOpenFiles) {
                         Icon(Icons.Default.FolderOpen, contentDescription = "Зашифрованные файлы")
                     }
-                    Icon(
-                        Icons.Default.Lock,
-                        contentDescription = "Заблокировать",
-                        modifier = Modifier
-                            .size(48.dp)
-                            .pointerInput(Unit) {
-                                awaitEachGesture {
-                                    awaitFirstDown(requireUnconsumed = false)
-                                    val releasedBeforeTimeout = kotlinx.coroutines.withTimeoutOrNull(5_000L) {
-                                        waitForUpOrCancellation() != null
-                                    }
-                                    when (releasedBeforeTimeout) {
-                                        null -> hiddenVaultCallback()
-                                        true -> lockCallback()
-                                        false -> Unit // cancelled touch; do not activate either action
-                                    }
+                    val baseViewConfiguration = LocalViewConfiguration.current
+                    val fiveSecondViewConfiguration = remember(baseViewConfiguration) {
+                        object : ViewConfiguration by baseViewConfiguration {
+                            override val longPressTimeoutMillis: Long = 5_000L
+                        }
+                    }
+                    CompositionLocalProvider(
+                        LocalViewConfiguration provides fiveSecondViewConfiguration
+                    ) {
+                        Icon(
+                            Icons.Default.Lock,
+                            contentDescription = "Заблокировать",
+                            modifier = Modifier
+                                .size(48.dp)
+                                .pointerInput(Unit) {
+                                    detectTapGestures(
+                                        onTap = { lockCallback() },
+                                        onLongPress = { hiddenVaultCallback() }
+                                    )
                                 }
-                            }
-                            .padding(12.dp)
-                    )
+                                .padding(12.dp)
+                        )
+                    }
                 }
             )
         },
