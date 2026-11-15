@@ -30,7 +30,6 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Fingerprint
-import androidx.compose.material.icons.filled.Image as ImageIcon
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
@@ -1473,7 +1472,7 @@ private fun VaultImageTile(
                         contentScale = ContentScale.Crop
                     )
                 } else {
-                    Icon(ImageIcon, contentDescription = null,
+                    Icon(Icons.Filled.Image, contentDescription = null,
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(30.dp))
                 }
