@@ -2246,9 +2246,10 @@ private fun VaultImageTile(
     ) {
         value = withContext(Dispatchers.IO) { repository.loadThumbnail(item.id, 420) }
     }
-    DisposableEffect(thumbnail) {
-        onDispose { thumbnail?.let { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() } }
-    }
+    // Do not manually recycle a Bitmap while Compose may still hold an ImageBitmap
+    // wrapper or a pending draw operation. Let the bitmap be reclaimed with the
+    // composable's references; recycling here can invalidate the image during the
+    // null -> decoded-bitmap state transition and crash the entire vault screen.
 
     Card(
         modifier = modifier.combinedClickable(
@@ -2370,16 +2371,20 @@ private fun VaultImagePreviewDialog(
     onExport: () -> Unit,
     onDelete: () -> Unit
 ) {
+    var previewLoadFinished by remember(item.id) { mutableStateOf(false) }
     val bitmap by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(
         null,
         item.id,
         repository
     ) {
-        value = withContext(Dispatchers.IO) { repository.loadThumbnail(item.id, 1800) }
+        previewLoadFinished = false
+        value = withContext(Dispatchers.IO) {
+            runCatching { repository.loadThumbnail(item.id, 1800) }.getOrNull()
+        }
+        previewLoadFinished = true
     }
-    DisposableEffect(bitmap) {
-        onDispose { bitmap?.let { image -> if (!image.isRecycled) image.recycle() } }
-    }
+    // Compose owns the ImageBitmap wrapper while the dialog is composed. Avoid
+    // Bitmap.recycle() here: a pending Compose draw can otherwise access freed pixels.
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(16.dp),
@@ -2399,6 +2404,12 @@ private fun VaultImagePreviewDialog(
                             contentDescription = item.name,
                             modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp),
                             contentScale = ContentScale.Fit
+                        )
+                    } else if (previewLoadFinished) {
+                        Text(
+                            "Не удалось создать предпросмотр. Файл можно экспортировать или удалить.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium
                         )
                     } else {
                         CircularProgressIndicator()

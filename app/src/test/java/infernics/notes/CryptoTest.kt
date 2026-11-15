@@ -28,6 +28,22 @@ class CryptoTest {
     }
 
     @Test
+    fun jpegPayloadSurvivesVaultStreamingEncryption() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val original = ByteArray(384 * 1024) { (it % 251).toByte() }.also {
+            it[0] = 0xFF.toByte()
+            it[1] = 0xD8.toByte()
+            it[it.lastIndex - 1] = 0xFF.toByte()
+            it[it.lastIndex] = 0xD9.toByte()
+        }
+        val encrypted = ByteArrayOutputStream()
+        crypto.encryptStream(ByteArrayInputStream(original), encrypted)
+        val decrypted = ByteArrayOutputStream()
+        crypto.decryptStream(ByteArrayInputStream(encrypted.toByteArray()), decrypted)
+        assertArrayEquals(original, decrypted.toByteArray())
+    }
+
+    @Test
     fun tamperedCiphertextIsRejected() {
         val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
         val encrypted = crypto.encrypt("authenticated content").also {
