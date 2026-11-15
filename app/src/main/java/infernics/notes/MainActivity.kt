@@ -1472,7 +1472,7 @@ private fun VaultImageTile(
                         contentScale = ContentScale.Crop
                     )
                 } else {
-                    Icon(Icons.Filled.Image, contentDescription = null,
+                    Icon(Icons.Default.InsertDriveFile, contentDescription = null,
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(30.dp))
                 }

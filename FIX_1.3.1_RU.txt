@@ -1,4 +1,4 @@
-SecNote 1.3.1 — исправление сборки
+SecNote 1.3.2 — исправление сборки
 
 Исправлена ошибка компиляции MainActivity.kt:1476.
 Иконка изображения теперь используется с явным receiver: Icons.Filled.Image.
@@ -6,6 +6,6 @@ SecNote 1.3.1 — исправление сборки
 
 Package ID не изменён: infernics.notes
 versionCode: 5
-versionName: 1.3.1
+versionName: 1.3.2
 
 Для обновления замените файлы проекта в текущем репозитории, но сохраните прежний signing/secure-notes-debug.keystore.
