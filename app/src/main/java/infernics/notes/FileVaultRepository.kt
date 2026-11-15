@@ -370,32 +370,51 @@ class FileVaultRepository(
      */
     fun loadThumbnail(id: String, maxDimension: Int = 420): Bitmap? = StorageGate.withAccess(generation) {
         require(maxDimension in 64..2048) { "Invalid thumbnail dimension" }
-        val temporaryPlaintext = File.createTempFile("$cachePrefix-thumbnail-", ".tmp", context.cacheDir)
+        var temporaryPlaintext: File? = null
         try {
-            readMetadata(id)
-            dataFile(id).inputStream().use { encryptedInput ->
-                temporaryPlaintext.outputStream().use { output ->
+            val metadata = readMetadata(id)
+            // Avoid attempting to decode unbounded or unexpectedly huge inputs into memory.
+            if (metadata.sizeBytes !in 1L..(160L * 1024L * 1024L)) return@withAccess null
+            val encryptedFile = dataFile(id)
+            if (!encryptedFile.isFile || encryptedFile.length() > 180L * 1024L * 1024L) {
+                return@withAccess null
+            }
+            val tempFile = File.createTempFile("$cachePrefix-thumbnail-", ".tmp", context.cacheDir)
+            temporaryPlaintext = tempFile
+            encryptedFile.inputStream().use { encryptedInput ->
+                tempFile.outputStream().use { output ->
                     crypto.decryptStream(encryptedInput, output)
                 }
             }
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(temporaryPlaintext.absolutePath, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withAccess null
-            var sampleSize = 1
-            while (maxOf(bounds.outWidth / sampleSize, bounds.outHeight / sampleSize) > maxDimension) {
-                sampleSize *= 2
+            val bounds = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+                inScaled = false
             }
+            BitmapFactory.decodeFile(tempFile.absolutePath, bounds)
+            val width = bounds.outWidth
+            val height = bounds.outHeight
+            if (width <= 0 || height <= 0) return@withAccess null
+
+            val sampleSize = ThumbnailDecodePolicy.sampleSize(width, height, maxDimension)
             val options = BitmapFactory.Options().apply {
                 inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
+                // RGB_565 halves the pixel memory footprint; appropriate for previews.
+                inPreferredConfig = Bitmap.Config.RGB_565
+                inDither = true
+                inScaled = false
+                inMutable = false
             }
-            BitmapFactory.decodeFile(temporaryPlaintext.absolutePath, options)
+            BitmapFactory.decodeFile(tempFile.absolutePath, options)
+        } catch (_: OutOfMemoryError) {
+            // A problematic very-large image must never crash the whole vault screen.
+            null
         } catch (_: Exception) {
             null
         } finally {
-            overwriteAndDelete(temporaryPlaintext)
+            temporaryPlaintext?.let(::overwriteAndDelete)
         }
     }
+
 
     private fun readMetadata(id: String): VaultFile {
         val json = JSONObject(crypto.decryptToText(metadataFile(id).readBytes()))

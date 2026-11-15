@@ -745,24 +745,37 @@ private fun MainScreen(
         )
     }
 
-    if (hiddenCrypto != null) {
-        FileVaultScreen(
-            activity = activity,
-            crypto = hiddenCrypto!!,
-            onBack = { hiddenCrypto = null },
-            onLock = onLock,
-            storageDirectoryName = HiddenVault.DIRECTORY_NAME
-        )
-        return
-    }
     BackHandler(enabled = cameraVisible || page != MainPage.NOTES) {
         if (cameraVisible) cameraVisible = false else page = MainPage.NOTES
+    }
+
+    if (hiddenCrypto != null) {
+        val sessionCrypto = hiddenCrypto!!
+        if (cameraVisible) {
+            CameraCaptureScreen(
+                activity = activity,
+                crypto = sessionCrypto,
+                storageDirectoryName = HiddenVault.DIRECTORY_NAME,
+                onClose = { cameraVisible = false }
+            )
+        } else {
+            FileVaultScreen(
+                activity = activity,
+                crypto = sessionCrypto,
+                onBack = { hiddenCrypto = null },
+                onLock = onLock,
+                onOpenCamera = { cameraVisible = true },
+                storageDirectoryName = HiddenVault.DIRECTORY_NAME
+            )
+        }
+        return
     }
 
     if (cameraVisible) {
         CameraCaptureScreen(
             activity = activity,
             crypto = crypto,
+            storageDirectoryName = "file_vault",
             onClose = { cameraVisible = false }
         )
     } else when (page) {
@@ -784,7 +797,8 @@ private fun MainScreen(
             activity = activity,
             crypto = crypto,
             onBack = { page = MainPage.NOTES },
-            onLock = onLock
+            onLock = onLock,
+            onOpenCamera = { cameraVisible = true }
         )
         MainPage.SETTINGS -> SettingsScreen(
             darkTheme = darkTheme,
@@ -1821,6 +1835,7 @@ private fun FileVaultScreen(
     crypto: Crypto,
     onBack: () -> Unit,
     onLock: () -> Unit,
+    onOpenCamera: () -> Unit,
     storageDirectoryName: String = "file_vault"
 ) {
     val context = LocalContext.current
@@ -2095,24 +2110,34 @@ private fun FileVaultScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = {
-                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                        type = "*/*"
-                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                        addFlags(
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                        )
-                    }
-                    activity.allowTemporarySystemUi = true
-                    activity.preserveSessionOnTemporaryUiReturn = true
-                    importLauncher.launch(intent)
-                }
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(Icons.Default.Add, contentDescription = "Добавить файл")
+                if (!selectionMode) {
+                    SmallFloatingActionButton(onClick = onOpenCamera) {
+                        Icon(Icons.Default.PhotoCamera, contentDescription = "Открыть камеру")
+                    }
+                }
+                FloatingActionButton(
+                    onClick = {
+                        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = "*/*"
+                            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                            addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                            )
+                        }
+                        activity.allowTemporarySystemUi = true
+                        activity.preserveSessionOnTemporaryUiReturn = true
+                        importLauncher.launch(intent)
+                    }
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Добавить файл")
+                }
             }
         }
     ) { padding ->

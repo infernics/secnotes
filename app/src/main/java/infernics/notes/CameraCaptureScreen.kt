@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.view.Surface
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -64,11 +65,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal fun CameraCaptureScreen(
     activity: MainActivity,
     crypto: Crypto,
+    storageDirectoryName: String = "file_vault",
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val repository = remember(crypto) { FileVaultRepository(context, crypto) }
+    // Camera captures must be saved into the same isolated file area that launched it.
+    val repository = remember(crypto, storageDirectoryName) {
+        FileVaultRepository(context, crypto, storageDirectoryName)
+    }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     val providerState = remember { mutableStateOf<ProcessCameraProvider?>(null) }
     val screenActive = remember { AtomicBoolean(true) }
@@ -84,6 +89,11 @@ internal fun CameraCaptureScreen(
     var capturing by remember { mutableStateOf(false) }
     var cameraError by remember { mutableStateOf<String?>(null) }
     var statusMessage by remember { mutableStateOf("Фотографии сохраняются сразу в зашифрованное хранилище.") }
+
+    // Do not dispose the camera pipeline while an encrypted save is still running.
+    BackHandler {
+        if (!capturing) onClose()
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -196,7 +206,7 @@ internal fun CameraCaptureScreen(
                         .background(Color.Black.copy(alpha = 0.42f)).padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onClose) {
+                    IconButton(onClick = onClose, enabled = !capturing) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Назад", tint = Color.White)
                     }
                     Text("Камера SecNote", color = Color.White, style = MaterialTheme.typography.titleMedium)
@@ -216,7 +226,7 @@ internal fun CameraCaptureScreen(
                     ) {
                         Text(message, color = Color.White)
                         Spacer(Modifier.height(12.dp))
-                        Button(onClick = onClose) { Text("Закрыть") }
+                        Button(onClick = onClose, enabled = !capturing) { Text("Закрыть") }
                     }
                 }
             }
