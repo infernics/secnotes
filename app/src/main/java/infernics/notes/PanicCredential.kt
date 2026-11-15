@@ -21,6 +21,7 @@ object PanicCredential {
     private const val ITERATIONS = 350_000
     private const val SALT_LENGTH = 16
     private const val VERIFIER_LENGTH = 32
+    private const val RECORD_LENGTH = 4 + SALT_LENGTH + VERIFIER_LENGTH
     private const val KEY_BITS = VERIFIER_LENGTH * 8
 
     fun isConfigured(context: Context): Boolean = credentialFile(context).isFile
@@ -29,18 +30,15 @@ object PanicCredential {
     fun set(context: Context, password: String) {
         require(password.length >= 8) { "Секретный пароль должен содержать не менее 8 символов." }
         val salt = ByteArray(SALT_LENGTH).also { SecureRandom().nextBytes(it) }
-        val verifier = derive(password, salt)
-        val serialized = ByteBuffer.allocate(4 + SALT_LENGTH + VERIFIER_LENGTH)
-            .putInt(MAGIC)
-            .put(salt)
-            .put(verifier)
-            .array()
-        try {
-            writeAtomically(credentialFile(context), serialized)
+        val record = try {
+            createRecord(password, salt)
         } finally {
             salt.fill(0)
-            verifier.fill(0)
-            serialized.fill(0)
+        }
+        try {
+            writeAtomically(credentialFile(context), record)
+        } finally {
+            record.fill(0)
         }
     }
 
@@ -48,25 +46,11 @@ object PanicCredential {
         if (password.isEmpty()) return false
         val file = credentialFile(context)
         if (!file.isFile) return false
-        val data = runCatching { file.readBytes() }.getOrNull() ?: return false
-        if (data.size != 4 + SALT_LENGTH + VERIFIER_LENGTH) return false
+        val record = runCatching { file.readBytes() }.getOrNull() ?: return false
         return try {
-            val buffer = ByteBuffer.wrap(data)
-            if (buffer.int != MAGIC) return false
-            val salt = ByteArray(SALT_LENGTH).also(buffer::get)
-            val expected = ByteArray(VERIFIER_LENGTH).also(buffer::get)
-            val actual = derive(password, salt)
-            try {
-                MessageDigest.isEqual(expected, actual)
-            } finally {
-                expected.fill(0)
-                actual.fill(0)
-                salt.fill(0)
-            }
-        } catch (_: Exception) {
-            false
+            verifyRecord(password, record)
         } finally {
-            data.fill(0)
+            record.fill(0)
         }
     }
 
@@ -76,6 +60,50 @@ object PanicCredential {
         bestEffortOverwrite(file)
         file.delete()
         File(file.parentFile, "$FILE_NAME.tmp").delete()
+    }
+
+
+    /**
+     * Pure helpers are internal so the verifier format can be unit-tested on the JVM.
+     * Kept compatible with the 1.3.3 test API: repositories upgraded by file upload
+     * can retain their older PanicCredentialTest.kt without breaking compilation.
+     */
+    internal fun createRecord(password: String, salt: ByteArray): ByteArray {
+        require(password.length >= 8) {
+            "Секретный пароль должен содержать не менее 8 символов."
+        }
+        require(salt.size == SALT_LENGTH) { "Некорректная соль секретного пароля." }
+        val verifier = derive(password, salt)
+        return try {
+            ByteBuffer.allocate(RECORD_LENGTH)
+                .putInt(MAGIC)
+                .put(salt)
+                .put(verifier)
+                .array()
+        } finally {
+            verifier.fill(0)
+        }
+    }
+
+    internal fun verifyRecord(password: String, record: ByteArray): Boolean {
+        if (password.isEmpty() || record.size != RECORD_LENGTH) return false
+        var salt: ByteArray? = null
+        var expected: ByteArray? = null
+        var actual: ByteArray? = null
+        return try {
+            val buffer = ByteBuffer.wrap(record)
+            if (buffer.int != MAGIC) return false
+            salt = ByteArray(SALT_LENGTH).also(buffer::get)
+            expected = ByteArray(VERIFIER_LENGTH).also(buffer::get)
+            actual = derive(password, salt)
+            MessageDigest.isEqual(expected, actual)
+        } catch (_: Exception) {
+            false
+        } finally {
+            salt?.fill(0)
+            expected?.fill(0)
+            actual?.fill(0)
+        }
     }
 
     private fun derive(password: String, salt: ByteArray): ByteArray {
