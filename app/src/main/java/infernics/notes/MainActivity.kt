@@ -44,6 +44,7 @@ import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -58,6 +59,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -592,13 +594,23 @@ private fun MainScreen(
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit
 ) {
     var page by remember { mutableStateOf(MainPage.NOTES) }
-    BackHandler(enabled = page != MainPage.NOTES) { page = MainPage.NOTES }
+    var cameraVisible by remember { mutableStateOf(false) }
+    BackHandler(enabled = cameraVisible || page != MainPage.NOTES) {
+        if (cameraVisible) cameraVisible = false else page = MainPage.NOTES
+    }
 
-    when (page) {
+    if (cameraVisible) {
+        CameraCaptureScreen(
+            activity = activity,
+            crypto = crypto,
+            onClose = { cameraVisible = false }
+        )
+    } else when (page) {
         MainPage.NOTES -> NotesHomeScreen(
             crypto = crypto,
             onOpenFiles = { page = MainPage.FILES },
             onOpenSettings = { page = MainPage.SETTINGS },
+            onOpenCamera = { cameraVisible = true },
             onLock = onLock
         )
         MainPage.FILES -> FileVaultScreen(
@@ -628,6 +640,7 @@ private fun NotesHomeScreen(
     crypto: Crypto,
     onOpenFiles: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenCamera: () -> Unit,
     onLock: () -> Unit
 ) {
     val context = LocalContext.current
@@ -698,6 +711,7 @@ private fun NotesHomeScreen(
             },
             onOpenFiles = onOpenFiles,
             onOpenSettings = onOpenSettings,
+            onOpenCamera = onOpenCamera,
             onLock = onLock
         )
     }
@@ -713,6 +727,7 @@ private fun NotesListScreen(
     onReorder: (String, String) -> Unit,
     onOpenFiles: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenCamera: () -> Unit,
     onLock: () -> Unit
 ) {
     var showCreateDialog by remember { mutableStateOf(false) }
@@ -768,8 +783,19 @@ private fun NotesListScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { showCreateDialog = true }) {
-                Icon(Icons.Default.Add, contentDescription = "Создать")
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                SmallFloatingActionButton(onClick = onOpenCamera) {
+                    Icon(
+                        Icons.Default.PhotoCamera,
+                        contentDescription = "Снять фото в зашифрованное хранилище"
+                    )
+                }
+                FloatingActionButton(onClick = { showCreateDialog = true }) {
+                    Icon(Icons.Default.Add, contentDescription = "Создать")
+                }
             }
         }
     ) { padding ->

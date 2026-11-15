@@ -9,9 +9,13 @@ import android.provider.OpenableColumns
 import android.system.Os
 import android.system.OsConstants
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 data class VaultFile(
@@ -87,6 +91,66 @@ class FileVaultRepository(
         val overwritten = bestEffortOverwriteSource(uri)
         val deleted = bestEffortDeleteSource(uri)
         VaultImportResult(item, overwritten, deleted)
+    }
+
+    /**
+     * Save a camera JPEG straight into the encrypted vault. The capture is supplied
+     * in memory; no plaintext image file is created on disk.
+     */
+    fun saveCapturedPhoto(jpegBytes: ByteArray): VaultFile {
+        try {
+            return StorageGate.withAccess(generation) {
+                require(jpegBytes.size >= 4 && jpegBytes[0] == 0xFF.toByte() && jpegBytes[1] == 0xD8.toByte()) {
+                    "Получен некорректный JPEG"
+                }
+                require(jpegBytes.size <= 80 * 1024 * 1024) { "Размер фотографии превышает 80 МБ" }
+
+                val id = UUID.randomUUID().toString()
+                val timestamp = System.currentTimeMillis()
+                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date(timestamp))
+                val item = VaultFile(
+                    id = id,
+                    name = "Фото_$stamp.jpg",
+                    mimeType = "image/jpeg",
+                    sizeBytes = jpegBytes.size.toLong(),
+                    addedAt = timestamp
+                )
+                val dataTemp = File(root, "$id.data.tmp")
+                val metaTemp = File(root, "$id.meta.tmp")
+                val dataTarget = dataFile(id)
+                val metaTarget = metadataFile(id)
+
+                try {
+                    ByteArrayInputStream(jpegBytes).use { source ->
+                        FileOutputStream(dataTemp, false).use { encryptedOutput ->
+                            crypto.encryptStream(source, encryptedOutput)
+                            encryptedOutput.fd.sync()
+                        }
+                    }
+                    val encryptedMetadata = crypto.encrypt(metadataJson(item))
+                    try {
+                        FileOutputStream(metaTemp, false).use { metadataOutput ->
+                            metadataOutput.write(encryptedMetadata)
+                            metadataOutput.fd.sync()
+                        }
+                    } finally {
+                        encryptedMetadata.fill(0)
+                    }
+                    check(dataTemp.renameTo(dataTarget)) { "Не удалось сохранить зашифрованную фотографию" }
+                    check(metaTemp.renameTo(metaTarget)) { "Не удалось сохранить метаданные фотографии" }
+                    item
+                } catch (error: Exception) {
+                    overwriteAndDelete(dataTemp)
+                    overwriteAndDelete(metaTemp)
+                    overwriteAndDelete(dataTarget)
+                    overwriteAndDelete(metaTarget)
+                    throw error
+                }
+            }
+        } finally {
+            // Best-effort zeroisation of the in-memory JPEG after encryption.
+            jpegBytes.fill(0)
+        }
     }
 
     /**
