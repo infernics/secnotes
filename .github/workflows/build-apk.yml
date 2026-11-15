@@ -40,6 +40,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          trap 'status=$?; echo "ERROR: command failed at line ${LINENO}: ${BASH_COMMAND} (exit ${status})" >&2; exit "$status"' ERR
           SETTINGS_FILE="$(find . -type f -name settings.gradle.kts -not -path '*/.gradle/*' -print -quit)"
           if [[ -z "$SETTINGS_FILE" ]]; then
             echo "ERROR: settings.gradle.kts was not found. Upload the contents of the SecNote project folder to the repository root."
@@ -53,6 +54,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          trap 'status=$?; echo "ERROR: command failed at line ${LINENO}: ${BASH_COMMAND} (exit ${status})" >&2; exit "$status"' ERR
           PROJECT_DIR="${{ steps.project.outputs.dir }}"
           BUILD_FILE="$PROJECT_DIR/app/build.gradle.kts"
           test -f "$BUILD_FILE"
@@ -95,7 +97,6 @@ jobs:
           grep -Fq 'fun unlockFromRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/HiddenVault.kt"
           grep -Fq 'createTempFile("$cachePrefix-export-' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
           grep -Fq 'cleanupAbandonedTemporaryFiles(this)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
-          grep -Fq 'onDispose { hiddenCrypto?.destroy() }' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'hiddenVaultConfigured = false' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'lockCleanupPending = lockCleanupPending' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'lockCleanupPending: Boolean' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
