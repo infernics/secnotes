@@ -11,14 +11,27 @@ import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
-import javax.crypto.spec.SecretKeySpec
+import javax.security.auth.Destroyable
+import java.util.Collections
+import java.util.WeakHashMap
 
 /**
  * AES-256-GCM encryption for both note records and vault files.
  * The passphrase-derived key remains the primary key. A copy of that key is
  * wrapped by Android Keystore only when the user explicitly enables biometrics.
  */
-class Crypto private constructor(private val key: SecretKey) {
+class Crypto private constructor(rawKey: ByteArray) {
+    private val key: SecretKey = WipeableAesKey(rawKey)
+
+    init {
+        synchronized(LIVE_INSTANCES) { LIVE_INSTANCES[this] = true }
+    }
+
+    /** Best-effort zeroisation of this in-memory content key. */
+    fun destroy() {
+        (key as? Destroyable)?.let { runCatching { it.destroy() } }
+        synchronized(LIVE_INSTANCES) { LIVE_INSTANCES.remove(this) }
+    }
 
     fun encrypt(plain: ByteArray): ByteArray {
         val iv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
@@ -158,6 +171,15 @@ class Crypto private constructor(private val key: SecretKey) {
 
     companion object {
         private val SECURE_RANDOM = SecureRandom()
+        private val LIVE_INSTANCES = Collections.synchronizedMap(WeakHashMap<Crypto, Boolean>())
+
+        /** Destroy all currently reachable SecNote content keys after storage operations drain. */
+        internal fun destroyAll() {
+            val instances = synchronized(LIVE_INSTANCES) {
+                LIVE_INSTANCES.keys.toList().also { LIVE_INSTANCES.clear() }
+            }
+            instances.forEach { it.destroy() }
+        }
         private const val ITERATIONS = 250_000
         private const val KEY_BITS = 256
         private const val SALT_LEN = 16
@@ -170,7 +192,8 @@ class Crypto private constructor(private val key: SecretKey) {
         fun newSalt(): ByteArray = ByteArray(SALT_LEN).also(SECURE_RANDOM::nextBytes)
 
         fun fromPassphrase(passphrase: String, salt: ByteArray): Crypto {
-            val spec = PBEKeySpec(passphrase.toCharArray(), salt, ITERATIONS, KEY_BITS)
+            val chars = passphrase.toCharArray()
+            val spec = PBEKeySpec(chars, salt, ITERATIONS, KEY_BITS)
             return try {
                 val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
                 val keyBytes = factory.generateSecret(spec).encoded
@@ -181,12 +204,39 @@ class Crypto private constructor(private val key: SecretKey) {
                 }
             } finally {
                 spec.clearPassword()
+                chars.fill('\u0000')
             }
         }
 
         internal fun fromRawKeyBytes(rawKey: ByteArray): Crypto {
             require(rawKey.size == KEY_BITS / 8) { "Invalid vault key length" }
-            return Crypto(SecretKeySpec(rawKey.copyOf(), "AES"))
+            return Crypto(rawKey)
         }
     }
+}
+
+
+/** SecretKey whose owned byte array can be cleared during emergency destruction. */
+private class WipeableAesKey(rawKey: ByteArray) : SecretKey, Destroyable {
+    @Volatile private var destroyed = false
+    private val lock = Any()
+    private var material: ByteArray = rawKey.copyOf()
+
+    override fun getAlgorithm(): String = "AES"
+    override fun getFormat(): String = "RAW"
+
+    override fun getEncoded(): ByteArray? = synchronized(lock) {
+        if (destroyed) null else material.copyOf()
+    }
+
+    override fun destroy() {
+        synchronized(lock) {
+            if (!destroyed) {
+                material.fill(0)
+                destroyed = true
+            }
+        }
+    }
+
+    override fun isDestroyed(): Boolean = destroyed
 }

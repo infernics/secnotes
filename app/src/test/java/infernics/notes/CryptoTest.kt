@@ -73,4 +73,19 @@ class CryptoTest {
         }
     }
 
+    @Test
+    fun destroyedContentKeyCannotBeUsedAgain() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val encrypted = crypto.encrypt("private")
+        assertEquals("private", crypto.decryptToText(encrypted))
+
+        crypto.destroy()
+        try {
+            crypto.decryptToText(encrypted)
+            fail("A destroyed in-memory content key must not decrypt data")
+        } catch (_: Exception) {
+            // Expected: key material was cleared.
+        }
+    }
+
 }

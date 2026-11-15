@@ -4,6 +4,8 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.util.UUID
 
 data class ChecklistItem(
@@ -20,51 +22,93 @@ data class Note(
     val body: String = "",
     val checklist: List<ChecklistItem> = emptyList(),
     val kind: NoteKind = NoteKind.NOTE,
-    val updatedAt: Long = System.currentTimeMillis()
+    val updatedAt: Long = System.currentTimeMillis(),
+    /** Long.MAX_VALUE marks records from older builds that used date ordering. */
+    val sortOrder: Long = Long.MAX_VALUE
 )
 
 /** Each note is a separate AES-256-GCM encrypted JSON file in private app storage. */
 class NoteRepository(context: Context, private val crypto: Crypto) {
-    private val dir = File(context.filesDir, "notes").apply { mkdirs() }
+    private val generation = StorageGate.currentGeneration()
+    private val dir = StorageGate.withAccess(generation) {
+        File(context.filesDir, "notes").apply { mkdirs() }
+    }
 
-    fun loadAll(): List<Note> = dir.listFiles { file -> file.name.endsWith(".enc") }
-        .orEmpty()
-        .mapNotNull { file ->
-            runCatching {
-                val json = JSONObject(crypto.decryptToText(file.readBytes()))
-                val checklistJson = json.optJSONArray("checklist") ?: JSONArray()
-                val checklist = buildList {
-                    for (index in 0 until checklistJson.length()) {
-                        val item = checklistJson.optJSONObject(index) ?: continue
-                        add(
-                            ChecklistItem(
-                                id = item.optString("id", UUID.randomUUID().toString()),
-                                text = item.optString("text", ""),
-                                checked = item.optBoolean("checked", false)
+    @Synchronized
+    fun loadAll(): List<Note> = StorageGate.withAccess(generation) {
+        val notes = dir.listFiles { file -> file.name.endsWith(".enc") }
+            .orEmpty()
+            .mapNotNull { file ->
+                runCatching {
+                    val json = JSONObject(crypto.decryptToText(file.readBytes()))
+                    val checklistJson = json.optJSONArray("checklist") ?: JSONArray()
+                    val checklist = buildList {
+                        for (index in 0 until checklistJson.length()) {
+                            val item = checklistJson.optJSONObject(index) ?: continue
+                            add(
+                                ChecklistItem(
+                                    id = item.optString("id", UUID.randomUUID().toString()),
+                                    text = item.optString("text", ""),
+                                    checked = item.optBoolean("checked", false)
+                                )
                             )
-                        )
+                        }
                     }
-                }
-                val storedKind = json.optString("kind", "").uppercase()
-                val kind = when (storedKind) {
-                    "LIST" -> NoteKind.LIST
-                    "NOTE" -> NoteKind.NOTE
-                    // Backward compatibility: older builds stored checklist rows inside notes.
-                    else -> if (checklist.isNotEmpty()) NoteKind.LIST else NoteKind.NOTE
-                }
-                Note(
-                    id = json.getString("id"),
-                    title = json.optString("title", ""),
-                    body = json.optString("body", ""),
-                    checklist = checklist,
-                    kind = kind,
-                    updatedAt = json.optLong("updatedAt", file.lastModified())
-                )
-            }.getOrNull()
+                    val storedKind = json.optString("kind", "").uppercase()
+                    val kind = when (storedKind) {
+                        "LIST" -> NoteKind.LIST
+                        "NOTE" -> NoteKind.NOTE
+                        else -> if (checklist.isNotEmpty()) NoteKind.LIST else NoteKind.NOTE
+                    }
+                    val updatedAt = json.optLong("updatedAt", file.lastModified())
+                    Note(
+                        id = json.getString("id"),
+                        title = json.optString("title", ""),
+                        body = json.optString("body", ""),
+                        checklist = checklist,
+                        kind = kind,
+                        updatedAt = updatedAt,
+                        sortOrder = json.optLong("sortOrder", Long.MAX_VALUE)
+                    )
+                }.getOrNull()
+            }
+        if (notes.any { it.sortOrder != Long.MAX_VALUE }) {
+            notes.sortedWith(compareBy<Note> { it.sortOrder }.thenByDescending { it.updatedAt })
+        } else {
+            notes.sortedByDescending { it.updatedAt }
         }
-        .sortedByDescending { it.updatedAt }
+    }
 
-    fun save(note: Note) {
+    @Synchronized
+    fun save(note: Note) = StorageGate.withAccess(generation) {
+        val target = File(dir, "${note.id}.enc")
+        val effectiveSortOrder = when {
+            note.sortOrder != Long.MAX_VALUE -> note.sortOrder
+            target.exists() -> readStoredSortOrder(target) ?: Long.MAX_VALUE
+            else -> {
+                val existing = loadAll()
+                if (existing.any { it.sortOrder != Long.MAX_VALUE }) {
+                    (existing.minOfOrNull { it.sortOrder } ?: 0L) - 1L
+                } else Long.MAX_VALUE
+            }
+        }
+        writeNote(note.copy(sortOrder = effectiveSortOrder), target)
+    }
+
+    /** Persist the visual order after a drag-and-drop operation. */
+    @Synchronized
+    fun reorder(orderedNotes: List<Note>) = StorageGate.withAccess(generation) {
+        orderedNotes.forEachIndexed { index, note ->
+            writeNote(note.copy(sortOrder = index.toLong()), File(dir, "${note.id}.enc"))
+        }
+    }
+
+    @Synchronized
+    fun delete(id: String) = StorageGate.withAccess(generation) {
+        overwriteAndDelete(File(dir, "$id.enc"))
+    }
+
+    private fun writeNote(note: Note, target: File) {
         val checklistJson = JSONArray().apply {
             note.checklist.forEach { item ->
                 put(
@@ -82,16 +126,42 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
             .put("checklist", checklistJson)
             .put("kind", note.kind.name)
             .put("updatedAt", note.updatedAt)
-        val target = File(dir, "${note.id}.enc")
+            .put("sortOrder", note.sortOrder)
         val temp = File(dir, "${note.id}.tmp")
-        temp.writeBytes(crypto.encrypt(json.toString()))
+        FileOutputStream(temp, false).use { stream ->
+            stream.write(crypto.encrypt(json.toString()))
+            stream.fd.sync()
+        }
         if (!temp.renameTo(target)) {
-            target.writeBytes(temp.readBytes())
+            FileOutputStream(target, false).use { stream ->
+                temp.inputStream().use { it.copyTo(stream) }
+                stream.fd.sync()
+            }
             temp.delete()
         }
     }
 
-    fun delete(id: String) {
-        File(dir, "$id.enc").delete()
+    private fun readStoredSortOrder(file: File): Long? = runCatching {
+        JSONObject(crypto.decryptToText(file.readBytes())).optLong("sortOrder", Long.MAX_VALUE)
+    }.getOrNull()
+
+    private fun overwriteAndDelete(file: File) {
+        if (!file.exists()) return
+        runCatching {
+            val originalLength = file.length()
+            RandomAccessFile(file, "rw").use { stream ->
+                stream.seek(0L)
+                val zeros = ByteArray(32 * 1024)
+                var remaining = originalLength
+                while (remaining > 0L) {
+                    val count = minOf(zeros.size.toLong(), remaining).toInt()
+                    stream.write(zeros, 0, count)
+                    remaining -= count.toLong()
+                }
+                stream.setLength(originalLength)
+                stream.fd.sync()
+            }
+        }
+        file.delete()
     }
 }

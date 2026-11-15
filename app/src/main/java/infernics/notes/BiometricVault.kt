@@ -37,7 +37,7 @@ object BiometricVault {
             prefs(context).contains(WRAPPED_KEY) && prefs(context).contains(IV)
 
     fun disable(context: Context) {
-        prefs(context).edit().clear().apply()
+        prefs(context).edit().clear().commit()
         runCatching {
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
             if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)

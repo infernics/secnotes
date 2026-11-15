@@ -2,25 +2,25 @@ package infernics.notes
 
 import android.content.Context
 import java.io.File
-import java.io.RandomAccessFile
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.security.KeyStore
 import java.util.Collections
 
 /**
- * Resumable emergency cleanup of SecNote-owned local data.
+ * Resumable emergency cleanup.
+ * A durable marker is written before cleanup starts. If Android kills the process,
+ * SecNote detects the marker on the next launch and continues cleanup before showing
+ * either the unlock screen or the first-run screen.
  *
- * A durable marker is written before the lockout notice is shown. If Android terminates
- * the process or the device restarts during cleanup, the marker causes cleanup to resume
- * before either the unlock or first-run screen is displayed.
- *
- * File overwrite is best effort only. Android flash translation layers and storage
- * providers do not let an ordinary app promise physical forensic erasure of old blocks.
- * Removing the password salt/verifier and all SecNote Keystore aliases makes the old
- * encrypted vault inaccessible to SecNote even if a stale ciphertext block remains.
+ * The app best-effort overwrites app-owned files and deletes them. Android flash storage
+ * and storage controllers can retain old physical blocks, so physical forensic erasure
+ * cannot be guaranteed by an ordinary app. Losing the vault password salt and encrypted
+ * verifier also prevents the app from deriving the old content key.
  */
 object EmergencyWipe {
     private const val MARKER = "secnote_emergency_wipe.pending"
+    private const val SHARED_PREFS = "shared_prefs"
     private const val KEYSTORE_ALIAS_PREFIX = "SecNote"
 
     fun isPending(context: Context): Boolean = markerFile(context).isFile
@@ -28,81 +28,67 @@ object EmergencyWipe {
     @Synchronized
     fun markPending(context: Context) {
         val marker = markerFile(context)
-        check(marker.parentFile?.let { it.exists() || it.mkdirs() } == true) {
-            "Не удалось создать защищённый маркер очистки."
-        }
+        marker.parentFile?.mkdirs()
         FileOutputStream(marker, false).use { stream ->
             stream.write("SECNOTE-WIPE-V1".toByteArray(Charsets.US_ASCII))
-            stream.flush()
             stream.fd.sync()
-        }
-        check(marker.isFile && marker.length() > 0L) {
-            "Не удалось сохранить маркер очистки."
         }
     }
 
-    /** Returns true only when all app-owned targets are cleared and the marker is removed. */
+    /** Returns true only after all app-owned storage targets are cleared and marker removed. */
     @Synchronized
     fun complete(context: Context): Boolean {
         if (!isPending(context)) markPending(context)
-
         return try {
-            // Disable the app's biometric preference and key before removing other data.
+            // Block and drain every in-flight note/file operation before deleting app data.
+            // Existing repository instances are invalidated by StorageGate's generation.
+            StorageGate.blockAndDrain()
+            // Wipe reachable in-memory content keys after all repository operations finish.
+            Crypto.destroyAll()
+
+            // Clear in-memory and on-disk preference caches, then revoke device-bound keys.
+            // This matters because deleting SharedPreferences files directly does not clear
+            // Android's process-local SharedPreferences cache.
+            AppPreferences.reset(context)
             BiometricVault.disable(context)
             if (!deleteSecNoteKeyStoreAliases()) return false
 
-            // Invalidate the old vault password and panic verifier first.
-            val criticalFiles = listOf(
-                "key.salt",
-                "key.check",
-                "panic.credential",
-                "key.salt.tmp",
-                "key.check.tmp",
-                "panic.credential.tmp"
-            )
-            for (name in criticalFiles) {
-                if (!wipeEntry(File(context.filesDir, name))) return false
-            }
+            // Invalidate the current password-derived key material before wiping payloads.
+            val criticalMaterialsClean = listOf(
+                "key.salt", "key.check", "panic.credential", "key.salt.tmp", "key.check.tmp"
+            ).all { name -> wipeEntry(File(context.filesDir, name)) }
+            if (!criticalMaterialsClean) return false
 
-            // These are all app-private or app-specific directories. Include secondary
-            // external volumes, while leaving user-owned Documents/Downloads untouched.
             val targets = buildList {
                 add(context.filesDir)
                 add(context.cacheDir)
                 add(context.codeCacheDir)
-                addAll(context.externalCacheDirs.filterNotNull())
-                addAll(context.getExternalFilesDirs(null).filterNotNull())
-                addAll(context.externalMediaDirs.filterNotNull())
-                add(File(context.applicationInfo.dataDir, "shared_prefs"))
+                add(File(context.applicationInfo.dataDir, SHARED_PREFS))
                 add(File(context.applicationInfo.dataDir, "databases"))
                 add(File(context.applicationInfo.dataDir, "app_webview"))
-            }.distinctBy { directory ->
-                runCatching { directory.canonicalPath }.getOrElse { directory.absolutePath }
-            }
+                add(File(context.applicationInfo.dataDir, "app_textures"))
+            }.distinctBy { it.absolutePath }
 
             for (directory in targets) {
                 if (directory.exists() && !wipeDirectoryContents(directory)) return false
             }
 
-            // Preserve the marker itself until the final operation so interrupted cleanup
-            // can always resume. Other no-backup files are SecNote-owned and are removed.
-            val marker = markerFile(context)
-            val preserved = setOf(marker.canonicalPath)
+            // Keep the durable marker until the very last step. Clear all other no-backup
+            // data, but preserve the marker itself so interrupted cleanup is resumable.
             val noBackup = context.noBackupFilesDir
-            if (noBackup.exists() && !wipeDirectoryContents(noBackup, preserved)) return false
+            val marker = markerFile(context)
+            if (noBackup.exists() && !wipeDirectoryContents(noBackup, setOf(marker.canonicalPath))) {
+                return false
+            }
 
-            // Verify that vault payload directories and key material are gone.
-            val mustBeAbsent = listOf(
-                File(context.filesDir, "key.salt"),
-                File(context.filesDir, "key.check"),
-                File(context.filesDir, "panic.credential"),
-                File(context.filesDir, "notes"),
-                File(context.filesDir, "file_vault")
-            )
-            if (mustBeAbsent.any { it.exists() }) return false
+            // Verify the password material and app-private data are no longer present.
+            if (File(context.filesDir, "key.salt").exists()) return false
+            if (File(context.filesDir, "key.check").exists()) return false
+            if (File(context.filesDir, "panic.credential").exists()) return false
+            if (File(context.filesDir, "notes").exists()) return false
+            if (File(context.filesDir, "file_vault").exists()) return false
 
-            val deleted = marker.delete() || !marker.exists()
-            deleted && !marker.exists()
+            marker.delete()
         } catch (_: Exception) {
             false
         }
@@ -116,8 +102,7 @@ object EmergencyWipe {
         aliases.none { store.containsAlias(it) }
     }.getOrDefault(false)
 
-    private fun markerFile(context: Context) =
-        File(context.noBackupFilesDir, MARKER)
+    private fun markerFile(context: Context) = File(context.noBackupFilesDir, MARKER)
 
     private fun wipeDirectoryContents(directory: File, preserved: Set<String> = emptySet()): Boolean {
         if (!directory.exists()) return true
@@ -128,38 +113,37 @@ object EmergencyWipe {
             if (canonical != null && canonical in preserved) continue
             if (!wipeEntry(child)) success = false
         }
-        return success && directory.listFiles()?.all { child ->
-            runCatching { child.canonicalPath in preserved }.getOrDefault(false)
+        return success && directory.listFiles()?.all {
+            runCatching { it.canonicalPath in preserved }.getOrDefault(false)
         } == true
     }
 
     private fun wipeEntry(entry: File): Boolean {
-        if (!entry.exists()) return true
         if (entry.isDirectory) {
             val children = entry.listFiles() ?: return false
             var success = true
             for (child in children) if (!wipeEntry(child)) success = false
-            if (!success) return false
-            return entry.delete() || !entry.exists()
+            return success && entry.delete()
         }
         bestEffortOverwrite(entry)
-        return entry.delete() || !entry.exists()
+        return !entry.exists() || entry.delete()
     }
 
     private fun bestEffortOverwrite(file: File) {
         if (!file.isFile) return
         runCatching {
             val originalLength = file.length()
-            RandomAccessFile(file, "rw").use { random ->
-                random.seek(0L)
+            RandomAccessFile(file, "rw").use { stream ->
+                stream.seek(0L)
                 val zeros = ByteArray(64 * 1024)
                 var remaining = originalLength
                 while (remaining > 0L) {
                     val count = minOf(zeros.size.toLong(), remaining).toInt()
-                    random.write(zeros, 0, count)
+                    stream.write(zeros, 0, count)
                     remaining -= count.toLong()
                 }
-                random.fd.sync()
+                stream.setLength(originalLength)
+                stream.fd.sync()
             }
         }
     }

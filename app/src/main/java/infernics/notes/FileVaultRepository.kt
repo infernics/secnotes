@@ -10,6 +10,8 @@ import android.system.Os
 import android.system.OsConstants
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.util.UUID
 
 data class VaultFile(
@@ -40,23 +42,32 @@ class FileVaultRepository(
     private val context: Context,
     private val crypto: Crypto
 ) {
-    private val root = File(context.filesDir, "file_vault").apply { mkdirs() }
-
-    init {
-        root.listFiles { file -> file.name.endsWith(".tmp") }?.forEach { it.delete() }
-        context.cacheDir.listFiles { file ->
-            file.name.startsWith("secnote-export-") || file.name.startsWith("secnote-thumbnail-")
-        }?.forEach { it.delete() }
-        cleanupOrphans()
+    private val generation = StorageGate.currentGeneration()
+    private val root = StorageGate.withAccess(generation) {
+        File(context.filesDir, "file_vault").apply { mkdirs() }
     }
 
-    fun loadAll(): List<VaultFile> = root.listFiles { file -> file.name.endsWith(".data.enc") }
-        .orEmpty()
-        .mapNotNull { dataFile ->
-            val id = dataFile.name.removeSuffix(".data.enc")
-            runCatching { readMetadata(id) }.getOrNull()
+    init {
+        StorageGate.withAccess(generation) {
+            // Remove leftovers from interrupted imports/exports. Cache files may contain
+            // short-lived plaintext, so use best-effort overwrite before deleting them.
+            root.listFiles { file -> file.name.endsWith(".tmp") }?.forEach(::overwriteAndDelete)
+            context.cacheDir.listFiles { file ->
+                file.name.startsWith("secnote-export-") || file.name.startsWith("secnote-thumbnail-")
+            }?.forEach(::overwriteAndDelete)
+            cleanupOrphans()
         }
-        .sortedByDescending { it.addedAt }
+    }
+
+    fun loadAll(): List<VaultFile> = StorageGate.withAccess(generation) {
+        root.listFiles { file -> file.name.endsWith(".data.enc") }
+            .orEmpty()
+            .mapNotNull { dataFile ->
+                val id = dataFile.name.removeSuffix(".data.enc")
+                runCatching { readMetadata(id) }.getOrNull()
+            }
+            .sortedByDescending { it.addedAt }
+    }
 
     /**
      * Encrypt the selected source first. Only after the encrypted data and metadata
@@ -64,11 +75,11 @@ class FileVaultRepository(
      * the original document. Physical erasure cannot be guaranteed on flash storage
      * or by third-party document providers.
      */
-    fun importAndRemoveOriginal(uri: Uri): VaultImportResult {
+    fun importAndRemoveOriginal(uri: Uri): VaultImportResult = StorageGate.withAccess(generation) {
         val item = importEncryptedCopy(uri)
         val overwritten = bestEffortOverwriteSource(uri)
         val deleted = bestEffortDeleteSource(uri)
-        return VaultImportResult(item, overwritten, deleted)
+        VaultImportResult(item, overwritten, deleted)
     }
 
     private fun importEncryptedCopy(uri: Uri): VaultFile {
@@ -85,8 +96,10 @@ class FileVaultRepository(
             val input = context.contentResolver.openInputStream(uri)
                 ?: error("Не удалось открыть выбранный файл")
             val size = input.use { source ->
-                dataTemp.outputStream().use { encryptedOutput ->
-                    crypto.encryptStream(source, encryptedOutput)
+                FileOutputStream(dataTemp, false).use { encryptedOutput ->
+                    val encryptedSize = crypto.encryptStream(source, encryptedOutput)
+                    encryptedOutput.fd.sync()
+                    encryptedSize
                 }
             }
             val item = VaultFile(
@@ -96,15 +109,25 @@ class FileVaultRepository(
                 sizeBytes = size,
                 addedAt = System.currentTimeMillis()
             )
-            metaTemp.writeBytes(crypto.encrypt(metadataJson(item)))
+            val encryptedMetadata = crypto.encrypt(metadataJson(item))
+            try {
+                FileOutputStream(metaTemp, false).use { metadataOutput ->
+                    metadataOutput.write(encryptedMetadata)
+                    metadataOutput.fd.sync()
+                }
+            } finally {
+                encryptedMetadata.fill(0)
+            }
             check(dataTemp.renameTo(dataTarget)) { "Не удалось сохранить зашифрованный файл" }
             check(metaTemp.renameTo(metaTarget)) { "Не удалось сохранить метаданные файла" }
             return item
         } catch (error: Exception) {
-            dataTemp.delete()
-            metaTemp.delete()
-            dataTarget.delete()
-            metaTarget.delete()
+            // A failed import may leave partial ciphertext. Remove it using the same
+            // best-effort overwrite path as a normal vault deletion.
+            overwriteAndDelete(dataTemp)
+            overwriteAndDelete(metaTemp)
+            overwriteAndDelete(dataTarget)
+            overwriteAndDelete(metaTarget)
             throw error
         }
     }
@@ -159,7 +182,7 @@ class FileVaultRepository(
     }
 
     /** Export exactly one vault item to a caller-selected document URI. */
-    fun export(id: String, destination: Uri) {
+    fun export(id: String, destination: Uri) = StorageGate.withAccess(generation) {
         val item = readMetadata(id)
         exportVerified(item, destination)
     }
@@ -169,7 +192,7 @@ class FileVaultRepository(
      * authenticated into a private temporary file before any plaintext is copied
      * to its destination. Individual failures do not abort the remaining exports.
      */
-    fun exportManyToTree(ids: Collection<String>, treeUri: Uri): BatchExportResult {
+    fun exportManyToTree(ids: Collection<String>, treeUri: Uri): BatchExportResult = StorageGate.withAccess(generation) {
         var exported = 0
         val failures = mutableListOf<String>()
         val treeDocumentUri = runCatching {
@@ -198,22 +221,22 @@ class FileVaultRepository(
                 failures += item.name
             }
         }
-        return BatchExportResult(exported, failures)
+        BatchExportResult(exported, failures)
     }
 
-    fun delete(id: String) {
-        dataFile(id).delete()
-        metadataFile(id).delete()
+    fun delete(id: String) = StorageGate.withAccess(generation) {
+        overwriteAndDelete(dataFile(id))
+        overwriteAndDelete(metadataFile(id))
     }
 
-    fun deleteMany(ids: Collection<String>): Int {
+    fun deleteMany(ids: Collection<String>): Int = StorageGate.withAccess(generation) {
         var removed = 0
         ids.distinct().forEach { id ->
             val existed = dataFile(id).exists() || metadataFile(id).exists()
             delete(id)
             if (existed && !dataFile(id).exists() && !metadataFile(id).exists()) removed++
         }
-        return removed
+        removed
     }
 
     /** Decrypt into a private temp file, then stream the verified data to the destination. */
@@ -231,7 +254,7 @@ class FileVaultRepository(
                 destinationOutput.use { target -> source.copyTo(target) }
             }
         } finally {
-            verifiedPlaintext.delete()
+            overwriteAndDelete(verifiedPlaintext)
         }
     }
 
@@ -239,10 +262,10 @@ class FileVaultRepository(
      * Decrypt an image to private cache, decode a bounded bitmap and delete the
      * plaintext temp file immediately afterwards.
      */
-    fun loadThumbnail(id: String, maxDimension: Int = 420): Bitmap? {
+    fun loadThumbnail(id: String, maxDimension: Int = 420): Bitmap? = StorageGate.withAccess(generation) {
         require(maxDimension in 64..2048) { "Invalid thumbnail dimension" }
         val temporaryPlaintext = File.createTempFile("secnote-thumbnail-", ".tmp", context.cacheDir)
-        return try {
+        try {
             readMetadata(id)
             dataFile(id).inputStream().use { encryptedInput ->
                 temporaryPlaintext.outputStream().use { output ->
@@ -251,7 +274,7 @@ class FileVaultRepository(
             }
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(temporaryPlaintext.absolutePath, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withAccess null
             var sampleSize = 1
             while (maxOf(bounds.outWidth / sampleSize, bounds.outHeight / sampleSize) > maxDimension) {
                 sampleSize *= 2
@@ -264,7 +287,7 @@ class FileVaultRepository(
         } catch (_: Exception) {
             null
         } finally {
-            temporaryPlaintext.delete()
+            overwriteAndDelete(temporaryPlaintext)
         }
     }
 
@@ -285,6 +308,26 @@ class FileVaultRepository(
         .put("sizeBytes", item.sizeBytes)
         .put("addedAt", item.addedAt)
         .toString()
+
+    private fun overwriteAndDelete(file: File) {
+        if (!file.exists()) return
+        runCatching {
+            val originalLength = file.length()
+            RandomAccessFile(file, "rw").use { stream ->
+                stream.seek(0L)
+                val zeros = ByteArray(64 * 1024)
+                var remaining = originalLength
+                while (remaining > 0L) {
+                    val count = minOf(zeros.size.toLong(), remaining).toInt()
+                    stream.write(zeros, 0, count)
+                    remaining -= count.toLong()
+                }
+                stream.setLength(originalLength)
+                stream.fd.sync()
+            }
+        }
+        file.delete()
+    }
 
     private fun dataFile(id: String) = File(root, "$id.data.enc")
     private fun metadataFile(id: String) = File(root, "$id.meta.enc")
@@ -318,7 +361,7 @@ class FileVaultRepository(
             .map { it.name.removeSuffix(".data.enc") }.toSet()
         val metadataIds = files.filter { it.name.endsWith(".meta.enc") }
             .map { it.name.removeSuffix(".meta.enc") }.toSet()
-        (dataIds - metadataIds).forEach { dataFile(it).delete() }
-        (metadataIds - dataIds).forEach { metadataFile(it).delete() }
+        (dataIds - metadataIds).forEach { overwriteAndDelete(dataFile(it)) }
+        (metadataIds - dataIds).forEach { overwriteAndDelete(metadataFile(it)) }
     }
 }

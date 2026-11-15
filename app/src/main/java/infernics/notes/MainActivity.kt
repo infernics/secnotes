@@ -1,5 +1,16 @@
 package infernics.notes
 
+import kotlin.math.abs
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
+import android.os.SystemClock
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.material3.FilterChip
+import androidx.compose.material.icons.filled.DragHandle
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
@@ -87,7 +98,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -96,7 +106,6 @@ import java.util.Locale
 
 class MainActivity : FragmentActivity() {
     // Temporary system authentication/document-picker UI is an intentional user action.
-    // The vault stays unlocked only until its result callback; ordinary backgrounding locks it.
     @Volatile var allowTemporarySystemUi: Boolean = false
     @Volatile var stoppedDuringTemporarySystemUi: Boolean = false
 
@@ -112,22 +121,21 @@ class MainActivity : FragmentActivity() {
 @Composable
 private fun SecNoteApp(activity: MainActivity) {
     val context = LocalContext.current
+    val appScope = rememberCoroutineScope()
     var crypto by remember { mutableStateOf<Crypto?>(null) }
     var needsSetup by remember { mutableStateOf(!Vault.isSetup(context)) }
     var darkTheme by remember { mutableStateOf(AppPreferences.isDarkTheme(context)) }
     var biometricEnabled by remember { mutableStateOf(BiometricVault.isEnabled(context)) }
+    var panicPasswordConfigured by remember { mutableStateOf(PanicCredential.isConfigured(context)) }
     var screenshotBlockingEnabled by remember {
         mutableStateOf(AppPreferences.isScreenshotBlockingEnabled(context))
     }
-    var panicPasswordConfigured by remember {
-        mutableStateOf(PanicCredential.isConfigured(context))
-    }
+    var autoLockMinutes by remember { mutableStateOf(AppPreferences.getAutoLockMinutes(context)) }
     var wipePending by remember { mutableStateOf(EmergencyWipe.isPending(context)) }
     var wipeFailed by remember { mutableStateOf(false) }
     var wipeAttempt by remember { mutableStateOf(0) }
 
-    // The marker is written before the lockout message. If Android kills the process,
-    // the next launch resumes cleanup before showing either Unlock or Setup.
+    // A wipe marker is durable and is handled before either the unlock or setup screen.
     LaunchedEffect(wipePending, wipeAttempt) {
         if (wipePending) {
             val completed = withContext(Dispatchers.IO) {
@@ -140,6 +148,7 @@ private fun SecNoteApp(activity: MainActivity) {
                 panicPasswordConfigured = false
                 darkTheme = true
                 screenshotBlockingEnabled = false
+                autoLockMinutes = 0
                 wipeFailed = false
                 wipePending = false
             } else {
@@ -148,29 +157,54 @@ private fun SecNoteApp(activity: MainActivity) {
         }
     }
 
-    // Existing automatic lock: erase the in-memory vault key when the app goes to background.
+    // Configurable lock delay. A killed process is always locked because the key only
+    // exists in memory; the timer only applies while the Activity remains alive.
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
+    DisposableEffect(lifecycleOwner, autoLockMinutes) {
+        var backgroundAtElapsed = 0L
+        var pendingLockJob: Job? = null
+        val timeoutMs = autoLockMinutes.toLong() * 60_000L
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
                     if (activity.allowTemporarySystemUi) {
                         activity.stoppedDuringTemporarySystemUi = true
                     } else {
-                        crypto = null
+                        backgroundAtElapsed = SystemClock.elapsedRealtime()
+                        pendingLockJob?.cancel()
+                        if (timeoutMs == 0L) {
+                            crypto = null
+                        } else {
+                            pendingLockJob = appScope.launch {
+                                delay(timeoutMs)
+                                if (backgroundAtElapsed != 0L && !activity.allowTemporarySystemUi) {
+                                    crypto = null
+                                }
+                            }
+                        }
                     }
                 }
                 Lifecycle.Event.ON_RESUME -> {
                     if (activity.stoppedDuringTemporarySystemUi && !activity.allowTemporarySystemUi) {
                         activity.stoppedDuringTemporarySystemUi = false
+                        backgroundAtElapsed = 0L
+                        pendingLockJob?.cancel()
                         crypto = null
+                    } else if (backgroundAtElapsed != 0L) {
+                        pendingLockJob?.cancel()
+                        val elapsed = SystemClock.elapsedRealtime() - backgroundAtElapsed
+                        if (elapsed >= timeoutMs) crypto = null
+                        backgroundAtElapsed = 0L
                     }
                 }
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            pendingLockJob?.cancel()
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     val scheme = if (darkTheme) secNoteDarkColors() else secNoteLightColors()
@@ -200,10 +234,7 @@ private fun SecNoteApp(activity: MainActivity) {
             when {
                 wipePending -> EmergencyWipeScreen(
                     failed = wipeFailed,
-                    onRetry = {
-                        wipeFailed = false
-                        wipeAttempt++
-                    }
+                    onRetry = { wipeFailed = false; wipeAttempt++ }
                 )
                 crypto == null && needsSetup -> SetupScreen(onCreated = {
                     crypto = it
@@ -216,7 +247,18 @@ private fun SecNoteApp(activity: MainActivity) {
                     onBiometricUnlock = { report ->
                         BiometricVault.unlock(
                             activity,
-                            onUnlocked = { unlocked -> crypto = unlocked },
+                            onUnlocked = { unlocked ->
+                                appScope.launch {
+                                    val vaultReady = withContext(Dispatchers.IO) {
+                                        Vault.ensureSaltWrapped(context, unlocked)
+                                    }
+                                    if (vaultReady) {
+                                        crypto = unlocked
+                                    } else {
+                                        report("Не удалось проверить ключ защищённого хранилища. Войдите по основному паролю.")
+                                    }
+                                }
+                            },
                             onError = { message ->
                                 biometricEnabled = BiometricVault.isEnabled(context)
                                 report(message)
@@ -229,9 +271,9 @@ private fun SecNoteApp(activity: MainActivity) {
                     crypto = crypto!!,
                     darkTheme = darkTheme,
                     biometricEnabled = biometricEnabled,
-                    screenshotBlockingEnabled = screenshotBlockingEnabled,
                     panicPasswordConfigured = panicPasswordConfigured,
-                    onPanicPasswordConfiguredChange = { panicPasswordConfigured = it },
+                    screenshotBlockingEnabled = screenshotBlockingEnabled,
+                    autoLockMinutes = autoLockMinutes,
                     onLock = { crypto = null },
                     onThemeChange = { enabled ->
                         darkTheme = enabled
@@ -241,6 +283,11 @@ private fun SecNoteApp(activity: MainActivity) {
                         screenshotBlockingEnabled = enabled
                         AppPreferences.setScreenshotBlockingEnabled(context, enabled)
                     },
+                    onAutoLockChange = { minutes ->
+                        autoLockMinutes = minutes
+                        AppPreferences.setAutoLockMinutes(context, minutes)
+                    },
+                    onPanicPasswordConfiguredChange = { panicPasswordConfigured = it },
                     onBiometricChange = { enabled, report ->
                         if (enabled) {
                             BiometricVault.enable(
@@ -282,7 +329,7 @@ private fun EmergencyWipeScreen(failed: Boolean, onRetry: () -> Unit) {
         Spacer(Modifier.height(10.dp))
         if (failed) {
             Text(
-                "Очистка ещё не завершена. SecNote заблокирован. Повторите операцию.",
+                "Очистка ещё не завершена. SecNote заблокирован и продолжит её после повтора.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(18.dp))
@@ -398,7 +445,11 @@ private fun SetupScreen(onCreated: (Crypto) -> Unit) {
                         runCatching { Vault.create(context, password) }
                     }
                     busy = false
-                    result.onSuccess(onCreated).onFailure {
+                    result.onSuccess { createdCrypto ->
+                        // Reopen local-storage access only after a completely new vault exists.
+                        StorageGate.resumeAfterNewVault()
+                        onCreated(createdCrypto)
+                    }.onFailure {
                         errorMessage = it.message ?: "Не удалось создать хранилище"
                     }
                 }
@@ -447,7 +498,6 @@ private fun LockScreen(
             onValueChange = { password = it; errorMessage = null },
             label = { Text("Пароль") },
             singleLine = true,
-            enabled = !busy,
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             modifier = Modifier.fillMaxWidth()
@@ -459,17 +509,13 @@ private fun LockScreen(
         Spacer(Modifier.height(16.dp))
         Button(
             onClick = {
-                val enteredPassword = password
                 busy = true
                 errorMessage = null
                 scope.launch {
-                    // Check the emergency credential before attempting normal unlock.
-                    val isEmergencyPassword = withContext(Dispatchers.Default) {
-                        PanicCredential.verify(context, enteredPassword)
+                    val isPanicPassword = withContext(Dispatchers.Default) {
+                        PanicCredential.verify(context, password)
                     }
-                    if (isEmergencyPassword) {
-                        // Persist the marker before displaying the neutral lockout notice.
-                        // A process death during the short delay will still resume the wipe.
+                    if (isPanicPassword) {
                         val markerWritten = withContext(Dispatchers.IO) {
                             runCatching { EmergencyWipe.markPending(context) }.isSuccess
                         }
@@ -477,14 +523,15 @@ private fun LockScreen(
                             errorMessage = "Не удалось начать защищённую очистку. Повторите попытку."
                             busy = false
                         } else {
+                            // The visible message is intentionally identical to a lockout notice.
                             errorMessage = "Попытки исчерпаны"
                             password = ""
-                            delay(1_100)
+                            delay(4_000)
                             onEmergencyWipe()
                         }
                     } else {
                         val unlocked = withContext(Dispatchers.Default) {
-                            Vault.unlock(context, enteredPassword)
+                            Vault.unlock(context, password)
                         }
                         busy = false
                         if (unlocked == null) {
@@ -525,12 +572,14 @@ private fun MainScreen(
     crypto: Crypto,
     darkTheme: Boolean,
     biometricEnabled: Boolean,
-    screenshotBlockingEnabled: Boolean,
     panicPasswordConfigured: Boolean,
-    onPanicPasswordConfiguredChange: (Boolean) -> Unit,
+    screenshotBlockingEnabled: Boolean,
+    autoLockMinutes: Int,
     onLock: () -> Unit,
     onThemeChange: (Boolean) -> Unit,
     onScreenshotBlockingChange: (Boolean) -> Unit,
+    onAutoLockChange: (Int) -> Unit,
+    onPanicPasswordConfiguredChange: (Boolean) -> Unit,
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit
 ) {
     var page by remember { mutableStateOf(MainPage.NOTES) }
@@ -552,11 +601,13 @@ private fun MainScreen(
         MainPage.SETTINGS -> SettingsScreen(
             darkTheme = darkTheme,
             biometricEnabled = biometricEnabled,
-            screenshotBlockingEnabled = screenshotBlockingEnabled,
             panicPasswordConfigured = panicPasswordConfigured,
-            onPanicPasswordConfiguredChange = onPanicPasswordConfiguredChange,
+            screenshotBlockingEnabled = screenshotBlockingEnabled,
+            autoLockMinutes = autoLockMinutes,
             onThemeChange = onThemeChange,
             onScreenshotBlockingChange = onScreenshotBlockingChange,
+            onAutoLockChange = onAutoLockChange,
+            onPanicPasswordConfiguredChange = onPanicPasswordConfiguredChange,
             onBiometricChange = onBiometricChange,
             onBack = { page = MainPage.NOTES }
         )
@@ -589,18 +640,25 @@ private fun NotesHomeScreen(
         NoteEditorScreen(
             note = current,
             isNew = editingIsNew,
-            onSaved = { changed ->
-                scope.launch {
-                    withContext(Dispatchers.IO) { repository.save(changed) }
-                    reload()
+            onAutoSave = { changed -> NoteSaveQueue.save(repository, changed) },
+            onFinish = { finalNote ->
+                if (finalNote == null) {
                     editing = null
+                } else {
+                    NoteSaveQueue.save(repository, finalNote) {
+                        scope.launch {
+                            reload()
+                            editing = null
+                        }
+                    }
                 }
             },
             onDeleted = { id ->
-                scope.launch {
-                    withContext(Dispatchers.IO) { repository.delete(id) }
-                    reload()
-                    editing = null
+                NoteSaveQueue.delete(repository, id) {
+                    scope.launch {
+                        reload()
+                        editing = null
+                    }
                 }
             },
             onDiscard = { editing = null }
@@ -617,6 +675,18 @@ private fun NotesHomeScreen(
                 editingIsNew = true
             },
             onOpen = { editing = it; editingIsNew = false },
+            onReorder = { fromId, toId ->
+                val fromIndex = notes.indexOfFirst { it.id == fromId }
+                val toIndex = notes.indexOfFirst { it.id == toId }
+                if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
+                    val reordered = notes.toMutableList().apply {
+                        val moving = removeAt(fromIndex)
+                        add(toIndex, moving)
+                    }
+                    notes = reordered
+                    NoteSaveQueue.reorder(repository, reordered)
+                }
+            },
             onOpenFiles = onOpenFiles,
             onOpenSettings = onOpenSettings,
             onLock = onLock
@@ -631,11 +701,16 @@ private fun NotesListScreen(
     loaded: Boolean,
     onNew: (NoteKind) -> Unit,
     onOpen: (Note) -> Unit,
+    onReorder: (String, String) -> Unit,
     onOpenFiles: () -> Unit,
     onOpenSettings: () -> Unit,
     onLock: () -> Unit
 ) {
     var showCreateDialog by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+    var draggedId by remember { mutableStateOf<String?>(null) }
+    var dragOffset by remember { mutableStateOf(0f) }
+    val reorderCallback by rememberUpdatedState(onReorder)
 
     if (showCreateDialog) {
         AlertDialog(
@@ -644,23 +719,13 @@ private fun NotesListScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
-                        onClick = {
-                            showCreateDialog = false
-                            onNew(NoteKind.NOTE)
-                        },
+                        onClick = { showCreateDialog = false; onNew(NoteKind.NOTE) },
                         modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Обычная заметка")
-                    }
+                    ) { Text("Обычная заметка") }
                     Button(
-                        onClick = {
-                            showCreateDialog = false
-                            onNew(NoteKind.LIST)
-                        },
+                        onClick = { showCreateDialog = false; onNew(NoteKind.LIST) },
                         modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Список")
-                    }
+                    ) { Text("Список") }
                 }
             },
             confirmButton = {},
@@ -682,11 +747,7 @@ private fun NotesListScreen(
                 },
                 actions = {
                     IconButton(onClick = onOpenSettings) {
-                        Icon(
-                            Icons.Default.Settings,
-                            contentDescription = "Настройки",
-                            modifier = Modifier.size(24.dp)
-                        )
+                        Icon(Icons.Default.Settings, contentDescription = "Настройки", modifier = Modifier.size(24.dp))
                     }
                     IconButton(onClick = onOpenFiles) {
                         Icon(Icons.Default.FolderOpen, contentDescription = "Зашифрованные файлы")
@@ -720,48 +781,100 @@ private fun NotesListScreen(
                         style = MaterialTheme.typography.bodySmall)
                 }
                 else -> LazyColumn(
+                    state = listState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(9.dp)
                 ) {
                     items(notes, key = { it.id }) { note ->
                         Card(
-                            onClick = { onOpen(note) },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .graphicsLayer {
+                                    translationY = if (draggedId == note.id) dragOffset else 0f
+                                    shadowElevation = if (draggedId == note.id) 12.dp.toPx() else 0f
+                                },
                             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
                         ) {
-                            Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(
+                                    Modifier.weight(1f)
+                                        .clickable { onOpen(note) }
+                                        .padding(horizontal = 16.dp, vertical = 14.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            note.title.ifBlank { if (note.kind == NoteKind.LIST) "Список" else "Без названия" },
+                                            style = MaterialTheme.typography.titleMedium,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (note.kind == NoteKind.LIST) {
+                                            Text(
+                                                "СПИСОК",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                    val preview = if (note.kind == NoteKind.LIST) {
+                                        val tasks = note.checklist.filter { it.text.isNotBlank() }
+                                        if (tasks.isEmpty()) "Пустой список"
+                                        else "${tasks.count { it.checked }}/${tasks.size} выполнено"
+                                    } else note.body.trim()
+                                    if (preview.isNotBlank()) {
+                                        Spacer(Modifier.height(5.dp))
+                                        Text(preview, maxLines = 2,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            style = MaterialTheme.typography.bodyMedium)
+                                    }
+                                    Spacer(Modifier.height(8.dp))
                                     Text(
-                                        note.title.ifBlank { if (note.kind == NoteKind.LIST) "Список" else "Без названия" },
-                                        style = MaterialTheme.typography.titleMedium,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Text(
-                                        if (note.kind == NoteKind.LIST) "СПИСОК" else "ЗАМЕТКА",
+                                        SimpleDateFormat("d MMM yyyy · HH:mm", Locale("ru")).format(Date(note.updatedAt)),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                val preview = if (note.kind == NoteKind.LIST) {
-                                    val tasks = note.checklist.filter { it.text.isNotBlank() }
-                                    if (tasks.isEmpty()) "Пустой список"
-                                    else "${tasks.count { it.checked }}/${tasks.size} выполнено"
-                                } else {
-                                    note.body.trim()
+                                Box(
+                                    modifier = Modifier
+                                        .size(52.dp)
+                                        .pointerInput(note.id) {
+                                            detectDragGesturesAfterLongPress(
+                                                onDragStart = {
+                                                    draggedId = note.id
+                                                    dragOffset = 0f
+                                                },
+                                                onDrag = { change, amount ->
+                                                    change.consume()
+                                                    if (draggedId == note.id) dragOffset += amount.y
+                                                },
+                                                onDragEnd = {
+                                                    val currentInfo = listState.layoutInfo.visibleItemsInfo
+                                                        .firstOrNull { it.key == note.id }
+                                                    if (currentInfo != null && dragOffset != 0f) {
+                                                        val draggedCenter = currentInfo.offset + currentInfo.size / 2f + dragOffset
+                                                        val target = listState.layoutInfo.visibleItemsInfo
+                                                            .filter { it.key != note.id }
+                                                            .minByOrNull { abs((it.offset + it.size / 2f) - draggedCenter) }
+                                                        val targetId = target?.key?.toString()
+                                                        if (targetId != null) reorderCallback(note.id, targetId)
+                                                    }
+                                                    draggedId = null
+                                                    dragOffset = 0f
+                                                },
+                                                onDragCancel = {
+                                                    draggedId = null
+                                                    dragOffset = 0f
+                                                }
+                                            )
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        Icons.Default.DragHandle,
+                                        contentDescription = "Перетащить заметку",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
-                                if (preview.isNotBlank()) {
-                                    Spacer(Modifier.height(5.dp))
-                                    Text(preview, maxLines = 2,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        style = MaterialTheme.typography.bodyMedium)
-                                }
-                                Spacer(Modifier.height(8.dp))
-                                Text(
-                                    SimpleDateFormat("d MMM yyyy · HH:mm", Locale("ru")).format(Date(note.updatedAt)),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
                             }
                         }
                     }
@@ -776,7 +889,8 @@ private fun NotesListScreen(
 private fun NoteEditorScreen(
     note: Note,
     isNew: Boolean,
-    onSaved: (Note) -> Unit,
+    onAutoSave: (Note) -> Unit,
+    onFinish: (Note?) -> Unit,
     onDeleted: (String) -> Unit,
     onDiscard: () -> Unit
 ) {
@@ -785,7 +899,6 @@ private fun NoteEditorScreen(
     var checklist by remember(note.id) {
         mutableStateOf(
             if (note.kind == NoteKind.LIST) {
-                // Migrate an old optional list description into the first inline checkbox row.
                 val legacyBody = note.body.trim()
                 when {
                     legacyBody.isNotEmpty() -> listOf(ChecklistItem(text = legacyBody)) + note.checklist
@@ -797,36 +910,73 @@ private fun NoteEditorScreen(
     }
     var focusNextId by remember(note.id) { mutableStateOf<String?>(null) }
     var askDelete by remember { mutableStateOf(false) }
+    var dirty by remember(note.id) { mutableStateOf(false) }
+    var hasBeenEdited by remember(note.id) { mutableStateOf(false) }
+    var saveStatus by remember(note.id) { mutableStateOf("Автосохранение включено") }
     val isList = note.kind == NoteKind.LIST
     val visibleTasks = checklist.filter { it.text.isNotBlank() }
+
+    fun currentNote(): Note {
+        val savedChecklist = if (isList) checklist.filter { it.text.isNotBlank() } else emptyList()
+        val savedBody = if (isList) "" else body
+        return note.copy(
+            title = title.trim(),
+            body = savedBody,
+            checklist = savedChecklist,
+            updatedAt = if (hasBeenEdited) System.currentTimeMillis() else note.updatedAt
+        )
+    }
 
     fun appendChecklistRow() {
         val newItem = ChecklistItem()
         checklist = checklist + newItem
         focusNextId = newItem.id
+        dirty = true
+        hasBeenEdited = true
+        saveStatus = "Есть несохранённые изменения"
     }
 
-    fun saveAndExit() {
-        val savedChecklist = if (isList) checklist.filter { it.text.isNotBlank() } else emptyList()
-        val savedBody = if (isList) "" else body
-        val hasContent = if (isList) savedChecklist.isNotEmpty() else savedBody.isNotBlank()
-        val blank = isNew && title.isBlank() && !hasContent
-        if (blank) {
+    fun finishEditing() {
+        val current = currentNote()
+        val hasContent = if (isList) current.checklist.isNotEmpty() else current.body.isNotBlank()
+        if (isNew && current.title.isBlank() && !hasContent) {
             onDiscard()
-            return
+        } else {
+            onFinish(current)
         }
-        val changed = title != note.title || savedBody != note.body || savedChecklist != note.checklist
-        onSaved(
-            note.copy(
-                title = title.trim(),
-                body = savedBody,
-                checklist = savedChecklist,
-                updatedAt = if (changed) System.currentTimeMillis() else note.updatedAt
-            )
-        )
     }
 
-    BackHandler { saveAndExit() }
+    // Debounced after each edit. The serial IO queue survives editor disposal and app locking.
+    LaunchedEffect(title, body, checklist, dirty) {
+        if (!dirty) return@LaunchedEffect
+        val candidate = currentNote()
+        if (isNew && candidate.title.isBlank() && candidate.body.isBlank() && candidate.checklist.isEmpty()) {
+            return@LaunchedEffect
+        }
+        saveStatus = "Сохранение…"
+        delay(400)
+        onAutoSave(candidate)
+        dirty = false
+        saveStatus = "Изменения сохраняются автоматически"
+    }
+
+    // Flush the latest editor state as soon as Android sends the app to the background.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val latestCandidate by rememberUpdatedState(currentNote())
+    val latestDirty by rememberUpdatedState(dirty)
+    val latestHasBeenEdited by rememberUpdatedState(hasBeenEdited)
+    val latestAutoSave by rememberUpdatedState(onAutoSave)
+    DisposableEffect(lifecycleOwner, note.id) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && (latestDirty || latestHasBeenEdited)) {
+                latestAutoSave(latestCandidate)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    BackHandler { finishEditing() }
     if (askDelete) {
         AlertDialog(
             onDismissRequest = { askDelete = false },
@@ -849,13 +999,13 @@ private fun NoteEditorScreen(
                         when {
                             isNew && isList -> "Новый список"
                             isNew -> "Новая заметка"
-                            isList -> "Редактирование списка"
-                            else -> "Редактирование заметки"
+                            isList -> "Список"
+                            else -> "Заметка"
                         }
                     )
                 },
                 navigationIcon = {
-                    IconButton(onClick = ::saveAndExit) {
+                    IconButton(onClick = ::finishEditing) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
                     }
                 },
@@ -875,7 +1025,7 @@ private fun NoteEditorScreen(
         ) {
             OutlinedTextField(
                 value = title,
-                onValueChange = { title = it },
+                onValueChange = { title = it; dirty = true; hasBeenEdited = true; saveStatus = "Сохранение…" },
                 label = { Text(if (isList) "Название списка" else "Заголовок") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
@@ -885,7 +1035,7 @@ private fun NoteEditorScreen(
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = body,
-                    onValueChange = { body = it },
+                    onValueChange = { body = it; dirty = true; hasBeenEdited = true; saveStatus = "Сохранение…" },
                     label = { Text("Текст заметки") },
                     minLines = 7,
                     modifier = Modifier.fillMaxWidth()
@@ -902,21 +1052,29 @@ private fun NoteEditorScreen(
                                 checklist = checklist.map { current ->
                                     if (current.id == item.id) current.copy(text = newText) else current
                                 }
+                                dirty = true
+                                hasBeenEdited = true
+                                saveStatus = "Сохранение…"
                             },
                             onCheckedChange = { checked ->
                                 checklist = checklist.map { current ->
                                     if (current.id == item.id) current.copy(checked = checked) else current
                                 }
+                                dirty = true
+                                hasBeenEdited = true
+                                saveStatus = "Сохранение…"
                             },
                             onNext = ::appendChecklistRow,
-                            onDelete = { checklist = checklist.filterNot { it.id == item.id } }
+                            onDelete = {
+                                checklist = checklist.filterNot { it.id == item.id }
+                                dirty = true
+                                hasBeenEdited = true
+                                saveStatus = "Сохранение…"
+                            }
                         )
                     }
                 }
-                TextButton(
-                    onClick = ::appendChecklistRow,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                TextButton(onClick = ::appendChecklistRow, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Новая строка")
@@ -931,10 +1089,13 @@ private fun NoteEditorScreen(
                 }
             }
 
-            Spacer(Modifier.height(22.dp))
-            Button(onClick = ::saveAndExit, modifier = Modifier.fillMaxWidth()) {
-                Text(if (isList) "Сохранить список" else "Сохранить заметку")
-            }
+            Spacer(Modifier.height(18.dp))
+            Text(
+                saveStatus,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp)
+            )
             Spacer(Modifier.height(12.dp))
         }
     }
@@ -1002,11 +1163,13 @@ private fun InlineChecklistRow(
 private fun SettingsScreen(
     darkTheme: Boolean,
     biometricEnabled: Boolean,
-    screenshotBlockingEnabled: Boolean,
     panicPasswordConfigured: Boolean,
-    onPanicPasswordConfiguredChange: (Boolean) -> Unit,
+    screenshotBlockingEnabled: Boolean,
+    autoLockMinutes: Int,
     onThemeChange: (Boolean) -> Unit,
     onScreenshotBlockingChange: (Boolean) -> Unit,
+    onAutoLockChange: (Int) -> Unit,
+    onPanicPasswordConfiguredChange: (Boolean) -> Unit,
     onBiometricChange: (Boolean, (String) -> Unit) -> Unit,
     onBack: () -> Unit
 ) {
@@ -1037,14 +1200,14 @@ private fun SettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        "Секретный пароль вводится в то же поле, что и основной. При его вводе SecNote покажет «Попытки исчерпаны» и без подтверждения начнёт необратимую очистку данных приложения.",
+                        "Этот пароль вводится в то же поле, что и основной. При его вводе SecNote покажет «Попытки исчерпаны» и без подтверждения начнёт необратимую очистку локального хранилища.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     OutlinedTextField(
                         value = panicPassword,
                         onValueChange = { panicPassword = it; panicError = null },
-                        label = { Text("Секретный пароль (не менее 8 символов)") },
+                        label = { Text("Секретный пароль (от 8 символов)") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -1060,11 +1223,8 @@ private fun SettingsScreen(
                         enabled = !panicBusy
                     )
                     if (panicError != null) {
-                        Text(
-                            panicError!!,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        Text(panicError!!, color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall)
                     }
                 }
             },
@@ -1076,7 +1236,10 @@ private fun SettingsScreen(
                         panicError = null
                         scope.launch {
                             val isPrimaryPassword = withContext(Dispatchers.Default) {
-                                Vault.unlock(context, panicPassword) != null
+                                val testCrypto = Vault.unlock(context, panicPassword)
+                                val matchesPrimary = testCrypto != null
+                                testCrypto?.destroy()
+                                matchesPrimary
                             }
                             if (isPrimaryPassword) {
                                 panicError = "Секретный пароль должен отличаться от основного."
@@ -1122,15 +1285,11 @@ private fun SettingsScreen(
             text = { Text("Секретный пароль будет удалён. Основной пароль и данные останутся без изменений.") },
             confirmButton = {
                 TextButton(onClick = {
-                    val removed = PanicCredential.remove(context)
-                    if (removed) {
-                        panicConfigured = false
-                        onPanicPasswordConfiguredChange(false)
-                        showRemovePanicDialog = false
-                        message = "Секретный пароль уничтожения удалён."
-                    } else {
-                        message = "Не удалось удалить секретный пароль. Повторите попытку."
-                    }
+                    PanicCredential.remove(context)
+                    panicConfigured = false
+                    onPanicPasswordConfiguredChange(false)
+                    showRemovePanicDialog = false
+                    message = "Секретный пароль уничтожения удалён."
                 }) { Text("Отключить") }
             },
             dismissButton = {
@@ -1152,7 +1311,7 @@ private fun SettingsScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("SecNote · версия 1.3.3", style = MaterialTheme.typography.labelMedium,
+            Text("SecNote · версия 1.4.0", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Пакет: infernics.notes", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1172,7 +1331,7 @@ private fun SettingsScreen(
                 title = "Вход по отпечатку",
                 subtitle = when {
                     biometricEnabled -> "Включён. Основной пароль остаётся доступен."
-                    biometricAvailable -> "Можно разблокировать приложение отпечатком или другим поддерживаемым сильным способом Android."
+                    biometricAvailable -> "Можно разблокировать приложение сильной биометрией Android."
                     biometricStatus == androidx.biometric.BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED ->
                         "Сначала добавьте отпечаток или биометрию в настройках Android."
                     else -> "На устройстве нет доступной сильной биометрии."
@@ -1183,11 +1342,6 @@ private fun SettingsScreen(
                     enabled = biometricAvailable || biometricEnabled,
                     onCheckedChange = { enabled -> onBiometricChange(enabled) { message = it } }
                 )
-            }
-            if (message != null) {
-                Spacer(Modifier.height(8.dp))
-                Text(message!!, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall)
             }
             Spacer(Modifier.height(18.dp))
             SettingRow(
@@ -1203,7 +1357,7 @@ private fun SettingsScreen(
                 title = "Секретный пароль уничтожения",
                 subtitle = if (panicConfigured)
                     "Установлен. Ввод на экране блокировки запускает необратимую очистку."
-                else "Не установлен. Задайте отдельный пароль для экстренного уничтожения данных."
+                else "Не установлен. При необходимости задайте отдельный пароль."
             ) {
                 TextButton(onClick = { showPanicDialog = true }) {
                     Text(if (panicConfigured) "Изменить" else "Установить")
@@ -1214,19 +1368,42 @@ private fun SettingsScreen(
                     Text("Отключить секретный пароль")
                 }
             }
-            Spacer(Modifier.height(25.dp))
+            if (message != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(message!!, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall)
+            }
+            Spacer(Modifier.height(26.dp))
             Text("Автоблокировка", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
-                "Уже включена: при сворачивании приложения ключ очищается из памяти, и для повторного входа требуется пароль или включённая биометрия.",
+                "После ухода приложения в фон доступ закроется по выбранному таймеру. Если Android завершит процесс, SecNote всегда будет заблокирован при следующем запуске.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodyMedium
+                style = MaterialTheme.typography.bodySmall
             )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                FilterChip(
+                    selected = autoLockMinutes == 0,
+                    onClick = { onAutoLockChange(0) },
+                    label = { Text("Мгновенно") }
+                )
+                FilterChip(
+                    selected = autoLockMinutes == 1,
+                    onClick = { onAutoLockChange(1) },
+                    label = { Text("1 мин") }
+                )
+                FilterChip(
+                    selected = autoLockMinutes == 5,
+                    onClick = { onAutoLockChange(5) },
+                    label = { Text("5 мин") }
+                )
+            }
             Spacer(Modifier.height(25.dp))
             Text("Хранилище", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             Text(
-                "Заметки и файлы хранятся в зашифрованном виде в приватной памяти приложения.",
+                "Заметки и файлы хранятся в зашифрованном виде в приватной памяти приложения. При экстренной очистке приложение уничтожает ключевые материалы и очищает внутренние данные. Физическое стирание старых блоков flash-памяти не может быть гарантировано обычным приложением Android.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium
             )
