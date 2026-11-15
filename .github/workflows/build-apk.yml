@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Test and build SecNote 1.4.1
+    name: Test and build SecNote 1.4.2
     runs-on: ubuntu-latest
 
     steps:
@@ -69,8 +69,8 @@ jobs:
           grep -Fq 'internal fun verifyRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
           grep -Fq 'applicationId = "infernics.notes"' "$BUILD_FILE"
           grep -Fq 'namespace = "infernics.notes"' "$BUILD_FILE"
-          grep -Fq 'versionCode = 9' "$BUILD_FILE"
-          grep -Fq 'versionName = "1.4.1"' "$BUILD_FILE"
+          grep -Fq 'versionCode = 10' "$BUILD_FILE"
+          grep -Fq 'versionName = "1.4.2"' "$BUILD_FILE"
           grep -Fq 'SecNoteVaultSaltKey' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'StorageGate.blockAndDrain()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
           grep -Fq 'delay(4_000)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
@@ -79,7 +79,13 @@ jobs:
           grep -Fq 'getAutoLockMinutes' "$PROJECT_DIR/app/src/main/java/infernics/notes/AppPreferences.kt"
           grep -Fq 'overwriteAndDelete' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
           grep -Fq 'bestEffortOverwriteSource' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
-          echo "Verified: infernics.notes, SecNote 1.4.1 (code 9), 4-second panic notice, emergency wipe, autosave, manual ordering, configurable auto-lock and encrypted file vault"
+          grep -Fq 'fun importManyAndRemoveOriginal' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          grep -Fq 'putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'private fun selectedDocumentUris' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'preserveSessionOnTemporaryUiReturn' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          ! grep -Fq 'lockAfterPicker' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          ! grep -Fq 'Переместить файл в защищённое хранилище?' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          echo "Verified: infernics.notes, SecNote 1.4.2 (code 10), multi-file import, cancellation-safe picker return, no import confirmation dialog, emergency wipe, autosave, manual ordering, configurable auto-lock and encrypted file vault"
 
       - name: Run unit tests and build APK
         run: gradle -p "${{ steps.project.outputs.dir }}" clean testDebugUnitTest assembleDebug --no-daemon --stacktrace
