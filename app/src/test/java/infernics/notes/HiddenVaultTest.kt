@@ -49,4 +49,50 @@ class HiddenVaultTest {
         assertFalse(HiddenVault.isValidRecord(record.copyOf(record.size - 1)))
     }
 
+    @Test
+    fun acceptsASingleCharacterHiddenPasswordAndRejectsOnlyEmptyInput() {
+        val salt = ByteArray(16) { (it + 9).toByte() }
+        val record = HiddenVault.createRecord("h", salt)
+        val unlocked = HiddenVault.unlockFromRecord("h", record)
+        assertNotNull(unlocked)
+        unlocked!!.destroy()
+        assertNull(HiddenVault.unlockFromRecord("", record))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun doesNotAllowAnEmptyHiddenPassword() {
+        HiddenVault.createRecord("", ByteArray(16))
+    }
+
+    @Test
+    fun hiddenWipeRemovesOnlyHiddenFilesAndHiddenTemporaryPreviews() {
+        val root = java.nio.file.Files.createTempDirectory("secnote-hidden-wipe-test").toFile()
+        val files = java.io.File(root, "files").apply { mkdirs() }
+        val cache = java.io.File(root, "cache").apply { mkdirs() }
+        try {
+            val hidden = java.io.File(files, HiddenVault.DIRECTORY_NAME).apply { mkdirs() }
+            java.io.File(hidden, "secret.data.enc").writeBytes(byteArrayOf(1, 2, 3, 4))
+            java.io.File(files, HiddenVault.METADATA_FILE_NAME).writeBytes(byteArrayOf(5, 6, 7))
+            java.io.File(files, "file_vault").apply { mkdirs() }
+                .resolve("primary.data.enc").writeBytes(byteArrayOf(8, 9))
+            java.io.File(files, "notes").apply { mkdirs() }
+                .resolve("primary-note.enc").writeBytes(byteArrayOf(10, 11))
+            java.io.File(files, "key.salt").writeBytes(byteArrayOf(12, 13))
+            java.io.File(cache, "media-thumbnail-secret.tmp").writeBytes(byteArrayOf(14, 15))
+            java.io.File(cache, "secnote-thumbnail-primary.tmp").writeBytes(byteArrayOf(16, 17))
+
+            HiddenVault.wipeLocalPayload(files, cache)
+
+            assertFalse(hidden.exists())
+            assertFalse(java.io.File(files, HiddenVault.METADATA_FILE_NAME).exists())
+            assertFalse(java.io.File(cache, "media-thumbnail-secret.tmp").exists())
+            assertTrue(java.io.File(files, "file_vault/primary.data.enc").isFile)
+            assertTrue(java.io.File(files, "notes/primary-note.enc").isFile)
+            assertTrue(java.io.File(files, "key.salt").isFile)
+            assertTrue(java.io.File(cache, "secnote-thumbnail-primary.tmp").isFile)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
 }

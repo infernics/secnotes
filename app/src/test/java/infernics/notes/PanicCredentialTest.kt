@@ -23,4 +23,17 @@ class PanicCredentialTest {
         val modified = record.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }
         assertFalse(PanicCredential.verifyRecord("emergency-code-42", modified))
     }
+    @Test
+    fun acceptsASingleCharacterSecretAndRejectsOnlyEmptyInput() {
+        val salt = ByteArray(16) { (it + 1).toByte() }
+        val record = PanicCredential.createRecord("x", salt)
+        assertTrue(PanicCredential.verifyRecord("x", record))
+        assertFalse(PanicCredential.verifyRecord("", record))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun doesNotAllowAnEmptyEmergencySecret() {
+        PanicCredential.createRecord("", ByteArray(16))
+    }
+
 }

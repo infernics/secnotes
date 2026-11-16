@@ -66,6 +66,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
@@ -122,6 +124,10 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Resume any dedicated hidden-area erasure before the unlock screen is exposed.
+        check(HiddenVault.recoverInterruptedWipe(this)) {
+            "Не удалось завершить защищённую очистку отдельного файлового пространства."
+        }
         // Roll back an interrupted encrypted-backup import before exposing the unlock screen.
         check(BackupManager.recoverInterruptedRestore(this)) {
             "Не удалось восстановить прежнее состояние после прерванного импорта резервной копии."
@@ -506,7 +512,7 @@ private fun SetupScreen(onCreated: (Crypto) -> Unit) {
         OutlinedTextField(
             value = password,
             onValueChange = { password = it; errorMessage = null },
-            label = { Text("Пароль (не менее 8 символов)") },
+            label = { Text("Пароль") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -545,7 +551,7 @@ private fun SetupScreen(onCreated: (Crypto) -> Unit) {
                     }
                 }
             },
-            enabled = !busy && password.length >= 8 && password == repeatedPassword,
+            enabled = !busy && password.isNotEmpty() && password == repeatedPassword,
             modifier = Modifier.fillMaxWidth()
         ) {
             if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -737,19 +743,34 @@ private fun MainScreen(
                         val suppliedPassword = hiddenPassword
                         hiddenPassword = ""
                         scope.launch {
-                            val result = withContext(Dispatchers.Default) {
-                                HiddenVault.unlock(context, suppliedPassword)
+                            val isEmergencySecret = withContext(Dispatchers.Default) {
+                                PanicCredential.verify(context, suppliedPassword)
                             }
-                            hiddenUnlockBusy = false
-                            if (result == null) {
+                            if (isEmergencySecret) {
+                                val erased = withContext(Dispatchers.IO) {
+                                    runCatching { HiddenVault.destroy(context) }.isSuccess
+                                }
+                                if (erased) onHiddenVaultConfiguredChange(false)
+                                hiddenUnlockBusy = false
+                                // Same generic response as a wrong password: the trigger is not
+                                // disclosed in the interface. Only the hidden area is erased.
                                 hiddenPasswordError = "Неверный пароль или хранилище повреждено."
-                            } else if (lockCleanupPending || StorageGate.isBlocked()) {
-                                result.destroy()
                             } else {
-                                hiddenCrypto = result
-                                showHiddenUnlock = false
-                                hiddenPasswordError = null
+                                val result = withContext(Dispatchers.Default) {
+                                    HiddenVault.unlock(context, suppliedPassword)
+                                }
+                                hiddenUnlockBusy = false
+                                if (result == null) {
+                                    hiddenPasswordError = "Неверный пароль или хранилище повреждено."
+                                } else if (lockCleanupPending || StorageGate.isBlocked()) {
+                                    result.destroy()
+                                } else {
+                                    hiddenCrypto = result
+                                    showHiddenUnlock = false
+                                    hiddenPasswordError = null
+                                }
                             }
+                            suppliedPassword.toCharArray().fill('\u0000')
                         }
                     }
                 ) { if (hiddenUnlockBusy) Text("Проверка…") else Text("Открыть") }
@@ -1536,7 +1557,7 @@ private fun SettingsScreen(
             title = { Text("Создать резервную копию") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Архив включает заметки, файлы и фотографии основного и дополнительного хранилищ, а также настройки. Он защищён отдельным паролем не короче 12 символов, который не должен совпадать с основным, дополнительным или секретным паролем уничтожения. Для будущего импорта понадобятся этот пароль архива и прежний основной пароль SecNote, действовавший на момент создания копии. Пароль дополнительного хранилища в архив не записывается — после переноса потребуется тот же пароль, который вы помните.", style = MaterialTheme.typography.bodySmall)
+                    Text("Архив включает заметки, файлы и фотографии основного и дополнительного хранилищ, а также настройки. Он защищён отдельным паролем, который должен отличаться от основного, дополнительного и секретного паролей. Для будущего импорта понадобятся этот пароль архива и прежний основной пароль SecNote, действовавший на момент создания копии. Пароль дополнительного хранилища в архив не записывается — после переноса потребуется тот же пароль, который вы помните.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = backupExportPassword,
                         onValueChange = { backupExportPassword = it },
@@ -1559,7 +1580,7 @@ private fun SettingsScreen(
             },
             confirmButton = {
                 TextButton(
-                    enabled = !backupBusy && backupExportPassword.length >= 12 && backupExportPassword == backupExportRepeat,
+                    enabled = !backupBusy && backupExportPassword.isNotEmpty() && backupExportPassword == backupExportRepeat,
                     onClick = {
                         pendingExportPassword = backupExportPassword
                         backupExportPassword = ""
@@ -1591,11 +1612,11 @@ private fun SettingsScreen(
                     modifier = Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text("Для этой версии архива нужны ДВА разных пароля. Первый — отдельный пароль резервной копии, заданный при экспорте (не менее 12 символов). Второй — ПРЕЖНИЙ основной пароль SecNote, которым были зашифрованы данные в момент создания копии (не менее 8 символов). Если после очистки данных вы создали новое пустое хранилище, пароль от него не подойдёт: укажите прежний пароль из исходного приложения. Пароль дополнительного хранилища не переносится и не нужен для импорта; после восстановления его по-прежнему нужно помнить. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
+                    Text("Для восстановления нужны ДВА разных пароля. Первый — отдельный пароль резервной копии, заданный при экспорте. Второй — ПРЕЖНИЙ основной пароль SecNote, которым были зашифрованы данные в момент создания копии. Если после очистки данных вы создали новое пустое хранилище, пароль от него не подойдёт: укажите прежний пароль из исходного приложения. Пароль дополнительного хранилища не переносится и не нужен для импорта; после восстановления его по-прежнему нужно помнить. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = backupImportPassword,
                         onValueChange = { backupImportPassword = it; backupImportError = null },
-                        label = { Text("1. Пароль резервной копии (12+ символов)") },
+                        label = { Text("1. Пароль резервной копии") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -1604,7 +1625,7 @@ private fun SettingsScreen(
                     OutlinedTextField(
                         value = backupSourceMainPassword,
                         onValueChange = { backupSourceMainPassword = it; backupImportError = null },
-                        label = { Text("2. Прежний основной пароль SecNote (8+ символов)") },
+                        label = { Text("2. Прежний основной пароль SecNote") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -1704,14 +1725,14 @@ private fun SettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        "Пароль не сохраняется в приложении и не может быть восстановлен. Используйте уникальную фразу длиной не менее 12 символов. Биометрический вход для этой области не применяется.",
+                        "Пароль не сохраняется в приложении и не может быть восстановлен. Биометрический вход для этой области не применяется.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     OutlinedTextField(
                         value = hiddenPassword,
                         onValueChange = { hiddenPassword = it; hiddenSetupError = null },
-                        label = { Text("Новый пароль (от 12 символов)") },
+                        label = { Text("Новый пароль") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -1734,7 +1755,7 @@ private fun SettingsScreen(
             },
             confirmButton = {
                 TextButton(
-                    enabled = !hiddenSetupBusy && hiddenPassword.length >= 12 && hiddenPassword == repeatedHiddenPassword,
+                    enabled = !hiddenSetupBusy && hiddenPassword.isNotEmpty() && hiddenPassword == repeatedHiddenPassword,
                     onClick = {
                         hiddenSetupBusy = true
                         val passphrase = hiddenPassword
@@ -1807,7 +1828,7 @@ private fun SettingsScreen(
                     OutlinedTextField(
                         value = panicPassword,
                         onValueChange = { panicPassword = it; panicError = null },
-                        label = { Text("Секретный пароль (от 8 символов)") },
+                        label = { Text("Секретный пароль") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -1830,7 +1851,7 @@ private fun SettingsScreen(
             },
             confirmButton = {
                 TextButton(
-                    enabled = !panicBusy && panicPassword.length >= 8 && panicPassword == repeatedPanicPassword,
+                    enabled = !panicBusy && panicPassword.isNotEmpty() && panicPassword == repeatedPanicPassword,
                     onClick = {
                         panicBusy = true
                         panicError = null
@@ -2357,6 +2378,7 @@ private fun FileVaultScreen(
 
     val imageFiles = files.filter { it.isImageFile() }
     val otherFiles = files.filterNot { it.isImageFile() }
+    var selectedTab by remember(storageDirectoryName) { mutableStateOf(0) }
 
     Scaffold(
         topBar = {
@@ -2445,20 +2467,74 @@ private fun FileVaultScreen(
                     style = MaterialTheme.typography.bodySmall
                 )
             }
+            TabRow(selectedTabIndex = selectedTab) {
+                Tab(
+                    selected = selectedTab == 0,
+                    onClick = { selectedTab = 0 },
+                    text = { Text("Фото (${imageFiles.size})") }
+                )
+                Tab(
+                    selected = selectedTab == 1,
+                    onClick = { selectedTab = 1 },
+                    text = { Text("Документы (${otherFiles.size})") }
+                )
+            }
             when {
                 loading || busy -> Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
-                files.isEmpty() -> Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                selectedTab == 0 && imageFiles.isEmpty() -> Box(
+                    Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center
+                ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(28.dp)) {
-                        Icon(Icons.Default.FolderOpen, contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(38.dp))
+                        Icon(Icons.Default.PhotoCamera, contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(38.dp))
                         Spacer(Modifier.height(10.dp))
-                        Text("Хранилище пусто")
-                        Text("Добавьте фото или документ кнопкой ниже.",
+                        Text("Фотографий пока нет")
+                        Text("Сделайте снимок камерой или добавьте фотографию кнопкой «+».",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+                selectedTab == 1 && otherFiles.isEmpty() -> Box(
+                    Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(28.dp)) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(38.dp))
+                        Spacer(Modifier.height(10.dp))
+                        Text("Документов пока нет")
+                        Text("Добавьте документ кнопкой «+».",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+                selectedTab == 0 -> LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(imageFiles.chunked(3), key = { row -> "images-${row.first().id}" }) { rowFiles ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(9.dp)
+                        ) {
+                            rowFiles.forEach { item ->
+                                VaultImageTile(
+                                    item = item,
+                                    repository = repository,
+                                    modifier = Modifier.weight(1f),
+                                    selected = item.id in selectedIds,
+                                    selectionMode = selectionMode,
+                                    onToggleSelection = { toggleSelection(item.id) },
+                                    onLongSelect = { toggleSelection(item.id) },
+                                    onPreview = { previewTarget = item },
+                                    onExport = { requestExport(item) },
+                                    onDelete = { deleteTarget = item }
+                                )
+                            }
+                            repeat(3 - rowFiles.size) { Spacer(Modifier.weight(1f)) }
+                        }
                     }
                 }
                 else -> LazyColumn(
@@ -2466,53 +2542,16 @@ private fun FileVaultScreen(
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    if (imageFiles.isNotEmpty()) {
-                        item {
-                            Text("Фотографии", style = MaterialTheme.typography.titleMedium,
-                                modifier = Modifier.padding(start = 2.dp, top = 4.dp, bottom = 2.dp))
-                        }
-                        items(imageFiles.chunked(3), key = { row -> "images-${row.first().id}" }) { rowFiles ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(9.dp)
-                            ) {
-                                rowFiles.forEach { item ->
-                                    VaultImageTile(
-                                        item = item,
-                                        repository = repository,
-                                        modifier = Modifier.weight(1f),
-                                        selected = item.id in selectedIds,
-                                        selectionMode = selectionMode,
-                                        onToggleSelection = { toggleSelection(item.id) },
-                                        onLongSelect = { toggleSelection(item.id) },
-                                        onPreview = { previewTarget = item },
-                                        onExport = { requestExport(item) },
-                                        onDelete = { deleteTarget = item }
-                                    )
-                                }
-                                repeat(3 - rowFiles.size) { Spacer(Modifier.weight(1f)) }
-                            }
-                        }
-                    }
-                    if (otherFiles.isNotEmpty()) {
-                        item {
-                            Text(
-                                "Файлы и документы",
-                                style = MaterialTheme.typography.titleMedium,
-                                modifier = Modifier.padding(start = 2.dp, top = if (imageFiles.isEmpty()) 4.dp else 14.dp, bottom = 2.dp)
-                            )
-                        }
-                        items(otherFiles, key = { it.id }) { item ->
-                            VaultDocumentRow(
-                                item = item,
-                                selected = item.id in selectedIds,
-                                selectionMode = selectionMode,
-                                onToggleSelection = { toggleSelection(item.id) },
-                                onLongSelect = { toggleSelection(item.id) },
-                                onExport = { requestExport(item) },
-                                onDelete = { deleteTarget = item }
-                            )
-                        }
+                    items(otherFiles, key = { it.id }) { item ->
+                        VaultDocumentRow(
+                            item = item,
+                            selected = item.id in selectedIds,
+                            selectionMode = selectionMode,
+                            onToggleSelection = { toggleSelection(item.id) },
+                            onLongSelect = { toggleSelection(item.id) },
+                            onExport = { requestExport(item) },
+                            onDelete = { deleteTarget = item }
+                        )
                     }
                 }
             }

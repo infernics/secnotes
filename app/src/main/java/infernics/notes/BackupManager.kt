@@ -44,8 +44,8 @@ internal class BackupRestoreException(
 /** Validates the two independent secrets needed by the version-1 backup format. */
 internal object BackupImportInputValidation {
     fun error(backupPassword: String, sourceMainPassword: String): String? = when {
-        backupPassword.length < 12 -> "Введите пароль резервной копии (не менее 12 символов)."
-        sourceMainPassword.length < 8 -> "Введите прежний основной пароль SecNote, которым пользовались при создании этой копии (не менее 8 символов). Новый пароль после очистки данных не подойдёт."
+        backupPassword.isEmpty() -> "Введите пароль резервной копии."
+        sourceMainPassword.isEmpty() -> "Введите прежний основной пароль SecNote, которым пользовались при создании этой копии. Новый пароль после очистки данных не подойдёт."
         backupPassword == sourceMainPassword -> "Пароль архива и прежний основной пароль должны отличаться."
         else -> null
     }
@@ -131,7 +131,7 @@ internal object BackupManager {
     private data class ExpectedEntry(val size: Long, val sha256: String)
 
     fun exportBackup(context: Context, currentCrypto: Crypto, backupPassword: String, destination: Uri) {
-        require(backupPassword.length >= 12) { "Пароль резервной копии должен содержать не менее 12 символов." }
+        require(backupPassword.isNotEmpty()) { "Введите пароль резервной копии." }
         require(!Vault.matchesPassphrase(context, backupPassword)) {
             "Пароль резервной копии должен отличаться от основного пароля."
         }

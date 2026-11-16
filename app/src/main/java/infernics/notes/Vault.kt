@@ -38,7 +38,7 @@ object Vault {
 
     @Synchronized
     fun create(context: Context, passphrase: String): Crypto {
-        require(passphrase.length >= 8) { "Пароль должен содержать не менее 8 символов" }
+        require(passphrase.isNotEmpty()) { "Введите пароль основного хранилища." }
         deleteSaltWrappingKey()
         val salt = Crypto.newSalt()
         val crypto = try {

@@ -28,7 +28,7 @@ object PanicCredential {
 
     @Synchronized
     fun set(context: Context, password: String) {
-        require(password.length >= 8) { "Секретный пароль должен содержать не менее 8 символов." }
+        require(password.isNotEmpty()) { "Введите секретный пароль." }
         val salt = ByteArray(SALT_LENGTH).also { SecureRandom().nextBytes(it) }
         val record = try {
             createRecord(password, salt)
@@ -69,9 +69,7 @@ object PanicCredential {
      * can retain their older PanicCredentialTest.kt without breaking compilation.
      */
     internal fun createRecord(password: String, salt: ByteArray): ByteArray {
-        require(password.length >= 8) {
-            "Секретный пароль должен содержать не менее 8 символов."
-        }
+        require(password.isNotEmpty()) { "Введите секретный пароль." }
         require(salt.size == SALT_LENGTH) { "Некорректная соль секретного пароля." }
         val verifier = derive(password, salt)
         return try {

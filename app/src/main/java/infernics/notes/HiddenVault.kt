@@ -33,7 +33,7 @@ object HiddenVault {
     }
 
     private fun configureInSession(context: Context, passphrase: String) {
-        require(passphrase.length >= 12) { "Пароль должен содержать не менее 12 символов." }
+        require(passphrase.isNotEmpty()) { "Введите пароль дополнительного хранилища." }
         val destination = metadataFile(context)
         val parent = destination.parentFile
         check(parent != null && (parent.isDirectory || parent.mkdirs())) {
@@ -70,6 +70,60 @@ object HiddenVault {
             record?.fill(0)
         }
     }
+
+    /**
+     * Destroys only the separate file area. A durable marker makes the operation
+     * resumable if Android terminates the process during deletion. The primary
+     * notes, primary files, primary salt and primary key are never touched here.
+     */
+    @Synchronized
+    fun destroy(context: Context) {
+        val marker = wipeMarker(context)
+        val parent = marker.parentFile
+        check(parent != null && (parent.isDirectory || parent.mkdirs())) {
+            "Не удалось начать очистку файлового пространства."
+        }
+        FileOutputStream(marker, false).use { stream ->
+            stream.write(byteArrayOf(0x53, 0x4E, 0x48, 0x57)) // SNHW
+            stream.fd.sync()
+        }
+        StorageGate.withExclusiveAccess {
+            wipeLocalPayload(context.filesDir, context.cacheDir)
+        }
+        check(marker.delete() || !marker.exists()) { "Не удалось завершить очистку файлового пространства." }
+    }
+
+    /** Complete an interrupted hidden-area wipe before the unlock UI is shown. */
+    @Synchronized
+    fun recoverInterruptedWipe(context: Context): Boolean {
+        val marker = wipeMarker(context)
+        if (!marker.exists()) return true
+        return runCatching {
+            StorageGate.withExclusiveAccess {
+                wipeLocalPayload(context.filesDir, context.cacheDir)
+            }
+            check(marker.delete() || !marker.exists())
+            true
+        }.getOrDefault(false)
+    }
+
+    /** Pure filesystem helper is exercised by JVM tests to prove primary data is retained. */
+    internal fun wipeLocalPayload(filesDirectory: File, cacheDirectory: File) {
+        overwriteAndDelete(File(filesDirectory, "$METADATA_NAME.tmp"))
+        overwriteAndDelete(File(filesDirectory, METADATA_NAME))
+        overwriteAndDelete(File(filesDirectory, DIRECTORY_NAME))
+        val hiddenCacheFiles = cacheDirectory.listFiles()?.filter { file ->
+            file.name.startsWith("media-export-") || file.name.startsWith("media-thumbnail-")
+        } ?: error("Не удалось проверить временные файлы скрытого пространства.")
+        hiddenCacheFiles.forEach(::overwriteAndDelete)
+        check(!File(filesDirectory, METADATA_NAME).exists())
+        check(!File(filesDirectory, DIRECTORY_NAME).exists())
+        check(cacheDirectory.listFiles()?.none { file ->
+            file.name.startsWith("media-export-") || file.name.startsWith("media-thumbnail-")
+        } == true) { "Не удалось удалить временные файлы скрытого пространства." }
+    }
+
+    private fun wipeMarker(context: Context) = File(context.noBackupFilesDir, "secnote_hidden_wipe.pending")
 
     internal fun isValidRecord(record: ByteArray): Boolean {
         val expectedSize = 4 + SALT_LENGTH + 12 + VERIFIER.size + 16
@@ -114,7 +168,7 @@ object HiddenVault {
 
     /** Pure helpers permit JVM tests of the verifier without an Android Context. */
     internal fun createRecord(passphrase: String, salt: ByteArray): ByteArray {
-        require(passphrase.length >= 12)
+        require(passphrase.isNotEmpty())
         require(salt.size == SALT_LENGTH)
         val crypto = Crypto.fromPassphrase(passphrase, salt)
         return try {
