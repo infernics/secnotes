@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Test and build SecNote 1.4.12
+    name: Test and build SecNote 1.4.13
     runs-on: ubuntu-latest
 
     steps:
@@ -90,8 +90,8 @@ jobs:
           grep -Fq 'androidx.camera:camera-lifecycle:1.5.3' "$BUILD_FILE"
           grep -Fq 'androidx.camera:camera-view:1.5.3' "$BUILD_FILE"
           grep -Fq 'namespace = "infernics.notes"' "$BUILD_FILE"
-          grep -Fq 'versionCode = 20' "$BUILD_FILE"
-          grep -Fq 'versionName = "1.4.12"' "$BUILD_FILE"
+          grep -Fq 'versionCode = 21' "$BUILD_FILE"
+          grep -Fq 'versionName = "1.4.13"' "$BUILD_FILE"
           grep -Fq 'SecNoteVaultSaltKey' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'fun matchesPassphrase' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'StorageGate.blockAndDrain()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
@@ -108,6 +108,17 @@ jobs:
           grep -Fq 'lockCleanupPending: Boolean' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'val sessionKey = hiddenCrypto' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'onDispose { sessionKey?.destroy() }' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'PanicCredential.verify(context, suppliedPassword)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'HiddenVault.destroy(context)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'fun recoverInterruptedWipe(context: Context)' "$PROJECT_DIR/app/src/main/java/infernics/notes/HiddenVault.kt"
+          grep -Fq 'wipeLocalPayload(context.filesDir, context.cacheDir)' "$PROJECT_DIR/app/src/main/java/infernics/notes/HiddenVault.kt"
+          grep -Fq 'TabRow(selectedTabIndex = selectedTab)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'Text("Фото (${imageFiles.size})")' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'Text("Документы (${otherFiles.size})")' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'acceptsASingleCharacterSecretAndRejectsOnlyEmptyInput' "$PROJECT_DIR/app/src/test/java/infernics/notes/PanicCredentialTest.kt"
+          grep -Fq 'acceptsASingleCharacterHiddenPasswordAndRejectsOnlyEmptyInput' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
+          grep -Fq 'hiddenWipeRemovesOnlyHiddenFilesAndHiddenTemporaryPreviews' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
+          ! grep -E 'length *>= *([0-9]+)|не менее [0-9]+ символ|от [0-9]+ символ|[0-9]+\+ символов' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt" "$PROJECT_DIR/app/src/main/java/infernics/notes/HiddenVault.kt" "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt" "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt" "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'detectTapGestures(' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'longPressTimeoutMillis: Long = 5_000L' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
           grep -Fq 'onLongPress = { hiddenVaultCallback() }' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
@@ -191,9 +202,9 @@ jobs:
           grep -Fq 'portableVerifierRecordHasAnExactExpectedLength' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
           grep -Fq 'BackupArchiveRules.validateFilePairs' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
           grep -Fq 'validatesPairedFilePayloads' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
-          grep -Fq 'requiresTheSeparateBackupPasswordAndOriginalMainPassword' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
+          grep -Fq 'requiresBothNonEmptyPasswordsButHasNoMinimumLength' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
           grep -Fq 'rejectsUsingTheSamePasswordForBothFields' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
-          echo "Verified: infernics.notes, SecNote 1.4.12 (code 20), encrypted portable backup/restore, primary and secondary encrypted stores, transactional rollback, preserved legacy features"
+          echo "Verified: infernics.notes, SecNote 1.4.13 (code 21), no password length minimums, hidden-only emergency wipe, photo/document tabs, encrypted portable backup/restore, primary and secondary encrypted stores"
 
       - name: Run unit tests and build APK
         run: gradle -p "${{ steps.project.outputs.dir }}" clean testDebugUnitTest assembleDebug --no-daemon --stacktrace
