@@ -266,10 +266,11 @@ internal fun CameraCaptureScreen(
                                         }
                                         return
                                     }
+                                    val capturedAtMillis = System.currentTimeMillis()
                                     activity.lifecycleScope.launch {
                                         try {
                                             withContext(Dispatchers.IO) {
-                                                repository.saveCapturedPhoto(jpeg)
+                                                repository.saveCapturedPhoto(jpeg, capturedAtMillis)
                                             }
                                             if (screenActive.get()) {
                                                 statusMessage = "Фото зашифровано и сохранено в файловом хранилище."

@@ -7,6 +7,7 @@ object AppPreferences {
     private const val KEY_DARK_THEME = "dark_theme"
     private const val KEY_SCREENSHOT_BLOCKING = "screenshot_blocking"
     private const val KEY_AUTO_LOCK_MINUTES = "auto_lock_minutes"
+    private const val KEY_INITIAL_BIOMETRIC_OFFER_PENDING = "initial_biometric_offer_pending"
 
     fun isDarkTheme(context: Context): Boolean =
         preferences(context).getBoolean(KEY_DARK_THEME, true)
@@ -20,6 +21,13 @@ object AppPreferences {
 
     fun setScreenshotBlockingEnabled(context: Context, enabled: Boolean) {
         preferences(context).edit().putBoolean(KEY_SCREENSHOT_BLOCKING, enabled).apply()
+    }
+
+    fun isInitialBiometricOfferPending(context: Context): Boolean =
+        preferences(context).getBoolean(KEY_INITIAL_BIOMETRIC_OFFER_PENDING, false)
+
+    fun setInitialBiometricOfferPending(context: Context, pending: Boolean) {
+        preferences(context).edit().putBoolean(KEY_INITIAL_BIOMETRIC_OFFER_PENDING, pending).commit()
     }
 
     /** -1 = never, 0 = immediately, positive values = minutes. */

@@ -95,12 +95,12 @@ internal object BackupArchiveRules {
             .groupBy { encryptedFileId(it.removePrefix(hiddenPrefix)) }
         hiddenIds.values.forEach { pair ->
             require(pair.size == 2 && pair.any { it.endsWith(".data.enc") } && pair.any { it.endsWith(".meta.enc") }) {
-                "В резервной копии найдена неполная пара файлов дополнительного хранилища."
+                "В резервной копии найдена неполная пара зашифрованных файлов."
             }
         }
         val hasHiddenFiles = paths.any { it.startsWith(hiddenPrefix) }
         require(!hasHiddenFiles || "hidden/${HiddenVault.METADATA_FILE_NAME}" in paths) {
-            "Зашифрованные файлы дополнительного хранилища не имеют ключевого описания."
+            "В зашифрованной области файлов отсутствует ключевое описание."
         }
     }
 
@@ -373,7 +373,7 @@ internal object BackupManager {
                 .forEach { add("hidden/${HiddenVault.DIRECTORY_NAME}/${it.name}", it) }
         } else {
             require(hiddenDirectory.listFiles().orEmpty().none { it.isFile && (it.name.endsWith(".data.enc") || it.name.endsWith(".meta.enc")) }) {
-                "Найдены файлы дополнительного хранилища без ключевого описания; резервная копия отменена."
+                "Найдены зашифрованные файлы без ключевого описания; резервная копия отменена."
             }
         }
 
@@ -556,7 +556,7 @@ internal object BackupManager {
             BackupArchiveRules.validateFilePairs(paths)
             require(!manifestPaths.containsKey("hidden/${HiddenVault.METADATA_FILE_NAME}") ||
                 File(payload, "hidden/${HiddenVault.METADATA_FILE_NAME}").isFile) {
-                "Отсутствует ключевое описание дополнительного хранилища."
+                "Отсутствует ключевое описание защищённой области файлов."
             }
             return extractedManifest
         } catch (error: Throwable) {
@@ -581,7 +581,7 @@ internal object BackupManager {
             val record = hiddenMetadata.readBytes()
             try {
                 require(HiddenVault.isValidRecord(record)) {
-                    "Повреждено описание дополнительного хранилища в резервной копии."
+                    "Повреждено ключевое описание защищённой области файлов в резервной копии."
                 }
             } finally {
                 record.fill(0)

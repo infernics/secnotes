@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.provider.MediaStore
+import androidx.exifinterface.media.ExifInterface
 import android.provider.OpenableColumns
 import android.system.Os
 import android.system.OsConstants
@@ -12,6 +14,7 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -23,7 +26,11 @@ data class VaultFile(
     val name: String,
     val mimeType: String,
     val sizeBytes: Long,
-    val addedAt: Long
+    val addedAt: Long,
+    /** Original capture date read from EXIF/MediaStore; null falls back to import date. */
+    val dateTakenAt: Long? = null,
+    /** True once the photo date was read (or confirmed unavailable), including legacy files. */
+    val photoDateResolved: Boolean = false
 )
 
 data class VaultImportResult(
@@ -69,7 +76,9 @@ class FileVaultRepository(
             // short-lived plaintext, so use best-effort overwrite before deleting them.
             root.listFiles { file -> file.name.endsWith(".tmp") }?.forEach(::overwriteAndDelete)
             context.cacheDir.listFiles { file ->
-                file.name.startsWith("$cachePrefix-export-") || file.name.startsWith("$cachePrefix-thumbnail-")
+                file.name.startsWith("$cachePrefix-export-") ||
+                    file.name.startsWith("$cachePrefix-thumbnail-") ||
+                    file.name.startsWith("$cachePrefix-date-")
             }?.forEach(::overwriteAndDelete)
             cleanupOrphans()
         }
@@ -81,6 +90,9 @@ class FileVaultRepository(
             .mapNotNull { dataFile ->
                 val id = dataFile.name.removeSuffix(".data.enc")
                 runCatching { readMetadata(id) }.getOrNull()
+            }
+            .map { item ->
+                if (item.isPhotoLike() && !item.photoDateResolved) resolveLegacyPhotoDate(item) else item
             }
             .sortedByDescending { it.addedAt }
     }
@@ -102,7 +114,10 @@ class FileVaultRepository(
      * Save a camera JPEG straight into the encrypted vault. The capture is supplied
      * in memory; no plaintext image file is created on disk.
      */
-    fun saveCapturedPhoto(jpegBytes: ByteArray): VaultFile {
+    fun saveCapturedPhoto(
+        jpegBytes: ByteArray,
+        capturedAtMillis: Long = System.currentTimeMillis()
+    ): VaultFile {
         try {
             return StorageGate.withAccess(generation) {
                 require(jpegBytes.size >= 4 && jpegBytes[0] == 0xFF.toByte() && jpegBytes[1] == 0xD8.toByte()) {
@@ -118,7 +133,9 @@ class FileVaultRepository(
                     name = "Фото_$stamp.jpg",
                     mimeType = "image/jpeg",
                     sizeBytes = jpegBytes.size.toLong(),
-                    addedAt = timestamp
+                    addedAt = timestamp,
+                    dateTakenAt = readPhotoDateFromStream(ByteArrayInputStream(jpegBytes)) ?: capturedAtMillis,
+                    photoDateResolved = true
                 )
                 val dataTemp = File(root, "$id.data.tmp")
                 val metaTemp = File(root, "$id.meta.tmp")
@@ -192,6 +209,10 @@ class FileVaultRepository(
         val displayName = queryDisplayName(uri).ifBlank { "Файл_${System.currentTimeMillis()}" }
         val name = displayName.substringAfterLast('/').substringAfterLast('\\').take(180)
         val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
+        val isPhoto = isPhotoLike(name, mime)
+        // Capture the embedded/MediaStore date before the source can be deleted.
+        // The image bytes and all EXIF metadata remain untouched.
+        val originalPhotoDate = if (isPhoto) readPhotoDateFromUri(uri) else null
         val id = UUID.randomUUID().toString()
         val dataTemp = File(root, "$id.data.tmp")
         val metaTemp = File(root, "$id.meta.tmp")
@@ -213,7 +234,9 @@ class FileVaultRepository(
                 name = name,
                 mimeType = mime,
                 sizeBytes = size,
-                addedAt = System.currentTimeMillis()
+                addedAt = System.currentTimeMillis(),
+                dateTakenAt = originalPhotoDate,
+                photoDateResolved = isPhoto
             )
             val encryptedMetadata = crypto.encrypt(metadataJson(item))
             try {
@@ -423,7 +446,9 @@ class FileVaultRepository(
             name = json.getString("name"),
             mimeType = json.optString("mimeType", "application/octet-stream"),
             sizeBytes = json.optLong("sizeBytes", 0L),
-            addedAt = json.optLong("addedAt", 0L)
+            addedAt = json.optLong("addedAt", 0L),
+            dateTakenAt = if (json.has("dateTakenAt") && !json.isNull("dateTakenAt")) json.optLong("dateTakenAt") else null,
+            photoDateResolved = json.optBoolean("photoDateResolved", json.has("dateTakenAt"))
         )
     }
 
@@ -432,7 +457,95 @@ class FileVaultRepository(
         .put("mimeType", item.mimeType)
         .put("sizeBytes", item.sizeBytes)
         .put("addedAt", item.addedAt)
+        .put("photoDateResolved", item.photoDateResolved)
+        .apply { item.dateTakenAt?.let { put("dateTakenAt", it) } }
         .toString()
+
+    private fun VaultFile.isPhotoLike(): Boolean = isPhotoLike(name, mimeType)
+
+    private fun isPhotoLike(name: String, mimeType: String): Boolean {
+        if (mimeType.lowercase(Locale.ROOT).startsWith("image/")) return true
+        return name.substringAfterLast('.', "").lowercase(Locale.ROOT) in setOf(
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif"
+        )
+    }
+
+    /** Reads a date only; the source image and its metadata are never modified. */
+    private fun readPhotoDateFromUri(uri: Uri): Long? {
+        val exifDate = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { readPhotoDateFromStream(it) }
+        }.getOrNull()
+        if (exifDate != null) return exifDate
+        return runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Images.Media.DATE_TAKEN),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                val column = cursor.getColumnIndex(MediaStore.Images.Media.DATE_TAKEN)
+                if (column >= 0 && cursor.moveToFirst()) cursor.getLong(column).takeIf { it > 0L } else null
+            }
+        }.getOrNull()
+    }
+
+    private fun readPhotoDateFromStream(input: InputStream): Long? = runCatching {
+        val exif = ExifInterface(input)
+        val original = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+            ?: exif.getAttribute(ExifInterface.TAG_DATETIME_DIGITIZED)
+            ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+        val offset = exif.getAttribute(ExifInterface.TAG_OFFSET_TIME_ORIGINAL)
+            ?: exif.getAttribute(ExifInterface.TAG_OFFSET_TIME_DIGITIZED)
+            ?: exif.getAttribute(ExifInterface.TAG_OFFSET_TIME)
+        PhotoDatePolicy.parseExifTimestamp(original, offset)
+    }.getOrNull()
+
+    /** One-time migration for old encrypted photos that predate the date field. */
+    private fun resolveLegacyPhotoDate(item: VaultFile): VaultFile {
+        var plaintext: File? = null
+        return try {
+            val tempFile = File.createTempFile("$cachePrefix-date-", ".tmp", context.cacheDir)
+            plaintext = tempFile
+            dataFile(item.id).inputStream().use { encryptedInput ->
+                tempFile.outputStream().use { output -> crypto.decryptStream(encryptedInput, output) }
+            }
+            val dateTaken = runCatching {
+                val exif = ExifInterface(tempFile.absolutePath)
+                val original = exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME_DIGITIZED)
+                    ?: exif.getAttribute(ExifInterface.TAG_DATETIME)
+                val offset = exif.getAttribute(ExifInterface.TAG_OFFSET_TIME_ORIGINAL)
+                    ?: exif.getAttribute(ExifInterface.TAG_OFFSET_TIME_DIGITIZED)
+                    ?: exif.getAttribute(ExifInterface.TAG_OFFSET_TIME)
+                PhotoDatePolicy.parseExifTimestamp(original, offset)
+            }.getOrNull()
+            val migrated = item.copy(dateTakenAt = dateTaken, photoDateResolved = true)
+            writeMetadataAtomically(migrated)
+            migrated
+        } catch (_: Exception) {
+            // Leave unresolved if a temporary read/write failed; next load retries it.
+            item
+        } finally {
+            plaintext?.let(::overwriteAndDelete)
+        }
+    }
+
+    private fun writeMetadataAtomically(item: VaultFile) {
+        val target = metadataFile(item.id)
+        val temp = File(root, "${item.id}.meta.migrate.tmp")
+        val encrypted = crypto.encrypt(metadataJson(item))
+        try {
+            FileOutputStream(temp, false).use { output ->
+                output.write(encrypted)
+                output.fd.sync()
+            }
+            check(temp.renameTo(target)) { "Не удалось сохранить дату фотографии" }
+        } finally {
+            encrypted.fill(0)
+            if (temp.exists()) overwriteAndDelete(temp)
+        }
+    }
 
     private fun overwriteAndDelete(file: File) {
         if (!file.exists()) return
@@ -501,8 +614,8 @@ class FileVaultRepository(
         /** Removes plaintext temp files left by a process crash before any vault is opened. */
         fun cleanupAbandonedTemporaryFiles(context: Context) {
             val prefixes = listOf(
-                "secnote-export-", "secnote-thumbnail-",
-                "media-export-", "media-thumbnail-"
+                "secnote-export-", "secnote-thumbnail-", "secnote-date-",
+                "media-export-", "media-thumbnail-", "media-date-"
             )
             context.cacheDir.listFiles { file -> prefixes.any { prefix -> file.name.startsWith(prefix) } }
                 ?.forEach(::overwriteAndDeleteTemporary)

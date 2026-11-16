@@ -1,6 +1,5 @@
 package infernics.notes
 
-import kotlin.math.abs
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import android.os.SystemClock
@@ -49,6 +48,8 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -64,6 +65,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Tab
@@ -92,6 +94,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
@@ -149,6 +152,9 @@ private fun SecNoteApp(activity: MainActivity) {
     var needsSetup by remember { mutableStateOf(!Vault.isSetup(context)) }
     var darkTheme by remember { mutableStateOf(AppPreferences.isDarkTheme(context)) }
     var biometricEnabled by remember { mutableStateOf(BiometricVault.isEnabled(context)) }
+    var biometricOfferPending by remember { mutableStateOf(AppPreferences.isInitialBiometricOfferPending(context)) }
+    var biometricOfferBusy by remember { mutableStateOf(false) }
+    var biometricOfferError by remember { mutableStateOf<String?>(null) }
     var panicPasswordConfigured by remember { mutableStateOf(PanicCredential.isConfigured(context)) }
     var hiddenVaultConfigured by remember { mutableStateOf(HiddenVault.isConfigured(context)) }
     var screenshotBlockingEnabled by remember {
@@ -301,6 +307,9 @@ private fun SecNoteApp(activity: MainActivity) {
                 crypto == null && needsSetup -> SetupScreen(onCreated = {
                     crypto = it
                     needsSetup = false
+                    AppPreferences.setInitialBiometricOfferPending(context, true)
+                    biometricOfferPending = true
+                    biometricOfferError = null
                 })
                 crypto == null -> LockScreen(
                     biometricEnabled = biometricEnabled,
@@ -393,6 +402,73 @@ private fun SecNoteApp(activity: MainActivity) {
                             biometricEnabled = false
                             report("Вход по биометрии отключён. Основной пароль продолжает работать.")
                         }
+                    }
+                )
+            }
+
+            if (crypto != null && biometricOfferPending && !biometricEnabled && !wipePending) {
+                val availability = BiometricVault.canAuthenticate(context)
+                val available = availability == androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
+                AlertDialog(
+                    onDismissRequest = {
+                        if (!biometricOfferBusy) {
+                            AppPreferences.setInitialBiometricOfferPending(context, false)
+                            biometricOfferPending = false
+                            biometricOfferError = null
+                        }
+                    },
+                    title = { Text("Включить биометрический вход?") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                if (available) "Можно разблокировать основное хранилище отпечатком или другой сильной биометрией Android. Основной пароль останется доступен. Скрытое хранилище биометрией не открывается."
+                                else "На устройстве пока недоступна сильная биометрия. Можно настроить её в Android и включить позднее в настройках SecNote."
+                            )
+                            biometricOfferError?.let {
+                                Text(it, color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        if (available) {
+                            TextButton(
+                                enabled = !biometricOfferBusy,
+                                onClick = {
+                                    val activeCrypto = crypto ?: return@TextButton
+                                    biometricOfferBusy = true
+                                    biometricOfferError = null
+                                    BiometricVault.enable(
+                                        activity,
+                                        activeCrypto,
+                                        onEnabled = {
+                                            biometricEnabled = true
+                                            biometricOfferBusy = false
+                                            biometricOfferPending = false
+                                            AppPreferences.setInitialBiometricOfferPending(context, false)
+                                        },
+                                        onError = { error ->
+                                            val lockAfterPrompt = activity.stoppedDuringTemporarySystemUi
+                                            activity.stoppedDuringTemporarySystemUi = false
+                                            activity.preserveSessionOnTemporaryUiReturn = false
+                                            if (lockAfterPrompt) lockMainVault()
+                                            biometricOfferBusy = false
+                                            biometricOfferError = error
+                                        }
+                                    )
+                                }
+                            ) { Text(if (biometricOfferBusy) "Ожидание…" else "Включить") }
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            enabled = !biometricOfferBusy,
+                            onClick = {
+                                AppPreferences.setInitialBiometricOfferPending(context, false)
+                                biometricOfferPending = false
+                                biometricOfferError = null
+                            }
+                        ) { Text("Позже") }
                     }
                 )
             }
@@ -504,7 +580,7 @@ private fun SetupScreen(onCreated: (Crypto) -> Unit) {
         Text("Создайте основной пароль", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         Text(
-            "Он защищает заметки и файлы. Биометрический вход можно включить позже в настройках.",
+            "Он защищает заметки и файлы. После создания пароля можно сразу включить биометрический вход или отказаться.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium
         )
@@ -941,7 +1017,7 @@ private fun NotesHomeScreen(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun NotesListScreen(
     notes: List<Note>,
@@ -1071,7 +1147,9 @@ private fun NotesListScreen(
                     items(notes, key = { it.id }) { note ->
                         Card(
                             modifier = Modifier
+                                .animateItem()
                                 .fillMaxWidth()
+                                .zIndex(if (draggedId == note.id) 1f else 0f)
                                 .graphicsLayer {
                                     translationY = if (draggedId == note.id) dragOffset else 0f
                                     shadowElevation = if (draggedId == note.id) 12.dp.toPx() else 0f
@@ -1127,19 +1205,32 @@ private fun NotesListScreen(
                                                 },
                                                 onDrag = { change, amount ->
                                                     change.consume()
-                                                    if (draggedId == note.id) dragOffset += amount.y
+                                                    if (draggedId == note.id) {
+                                                        dragOffset += amount.y
+                                                        val visible = listState.layoutInfo.visibleItemsInfo
+                                                        val draggedInfo = visible.firstOrNull { it.key == note.id }
+                                                        if (draggedInfo != null && amount.y != 0f) {
+                                                            val draggedCenter = draggedInfo.offset + draggedInfo.size / 2f + dragOffset
+                                                            val target = if (amount.y > 0f) {
+                                                                visible.firstOrNull { it.index == draggedInfo.index + 1 }
+                                                            } else {
+                                                                visible.firstOrNull { it.index == draggedInfo.index - 1 }
+                                                            }
+                                                            if (target != null) {
+                                                                val targetCenter = target.offset + target.size / 2f
+                                                                val crossed = if (amount.y > 0f) draggedCenter > targetCenter
+                                                                    else draggedCenter < targetCenter
+                                                                if (crossed) {
+                                                                    reorderCallback(note.id, target.key.toString())
+                                                                    // Keep the dragged card under the pointer while the two
+                                                                    // stable-key items animate into each other's positions.
+                                                                    dragOffset -= (target.offset - draggedInfo.offset).toFloat()
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 },
                                                 onDragEnd = {
-                                                    val currentInfo = listState.layoutInfo.visibleItemsInfo
-                                                        .firstOrNull { it.key == note.id }
-                                                    if (currentInfo != null && dragOffset != 0f) {
-                                                        val draggedCenter = currentInfo.offset + currentInfo.size / 2f + dragOffset
-                                                        val target = listState.layoutInfo.visibleItemsInfo
-                                                            .filter { it.key != note.id }
-                                                            .minByOrNull { abs((it.offset + it.size / 2f) - draggedCenter) }
-                                                        val targetId = target?.key?.toString()
-                                                        if (targetId != null) reorderCallback(note.id, targetId)
-                                                    }
                                                     draggedId = null
                                                     dragOffset = 0f
                                                 },
@@ -1550,6 +1641,17 @@ private fun SettingsScreen(
         }
     }
     val biometricAvailable = biometricStatus == androidx.biometric.BiometricManager.BIOMETRIC_SUCCESS
+    val functionalSwitchColors = SwitchDefaults.colors(
+        checkedThumbColor = if (darkTheme) Color(0xFF17191B) else Color.White,
+        checkedTrackColor = if (darkTheme) Color(0xFFC5CDD3) else Color(0xFF51585E),
+        checkedBorderColor = if (darkTheme) Color(0xFFC5CDD3) else Color(0xFF51585E),
+        uncheckedThumbColor = if (darkTheme) Color(0xFFE4E8EB) else Color(0xFF5D656B),
+        uncheckedTrackColor = if (darkTheme) Color(0xFF46505A) else Color(0xFFD7DDE1),
+        uncheckedBorderColor = if (darkTheme) Color(0xFF9AA5AE) else Color(0xFF808A91),
+        disabledUncheckedThumbColor = if (darkTheme) Color(0xFF9AA3AA) else Color(0xFFB4BAC0),
+        disabledUncheckedTrackColor = if (darkTheme) Color(0xFF333A40) else Color(0xFFE5E8EA),
+        disabledUncheckedBorderColor = if (darkTheme) Color(0xFF59636B) else Color(0xFFB5BCC1)
+    )
 
     if (showBackupExportDialog) {
         AlertDialog(
@@ -1557,7 +1659,7 @@ private fun SettingsScreen(
             title = { Text("Создать резервную копию") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Архив включает заметки, файлы и фотографии основного и дополнительного хранилищ, а также настройки. Он защищён отдельным паролем, который должен отличаться от основного, дополнительного и секретного паролей. Для будущего импорта понадобятся этот пароль архива и прежний основной пароль SecNote, действовавший на момент создания копии. Пароль дополнительного хранилища в архив не записывается — после переноса потребуется тот же пароль, который вы помните.", style = MaterialTheme.typography.bodySmall)
+                    Text("Архив включает заметки, фотографии, файлы и настройки SecNote. Он защищён отдельным паролем, который не должен совпадать с другими паролями приложения. Для будущего импорта понадобятся пароль архива и прежний основной пароль SecNote, действовавший на момент создания копии. Биометрическая привязка к устройству не переносится и на новом телефоне настраивается заново.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = backupExportPassword,
                         onValueChange = { backupExportPassword = it },
@@ -1612,7 +1714,7 @@ private fun SettingsScreen(
                     modifier = Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text("Для восстановления нужны ДВА разных пароля. Первый — отдельный пароль резервной копии, заданный при экспорте. Второй — ПРЕЖНИЙ основной пароль SecNote, которым были зашифрованы данные в момент создания копии. Если после очистки данных вы создали новое пустое хранилище, пароль от него не подойдёт: укажите прежний пароль из исходного приложения. Пароль дополнительного хранилища не переносится и не нужен для импорта; после восстановления его по-прежнему нужно помнить. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
+                    Text("Для восстановления нужны ДВА разных пароля. Первый — отдельный пароль резервной копии, заданный при экспорте. Второй — ПРЕЖНИЙ основной пароль SecNote, которым были зашифрованы данные в момент создания копии. Если после очистки данных вы создали новое пустое хранилище, пароль от него не подойдёт: укажите прежний пароль из исходного приложения. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = backupImportPassword,
                         onValueChange = { backupImportPassword = it; backupImportError = null },
@@ -1788,7 +1890,7 @@ private fun SettingsScreen(
                             result.onSuccess {
                                 onHiddenVaultConfiguredChange(true)
                                 showHiddenSetupDialog = false
-                                message = "Дополнительное файловое хранилище настроено. Пароль хранится только в вашей памяти."
+                                message = "Настройки сохранены."
                             }.onFailure { error ->
                                 hiddenSetupError = error.message ?: "Не удалось настроить хранилище."
                             }
@@ -1868,10 +1970,10 @@ private fun SettingsScreen(
                                 }
                             }
                             if (isPrimaryPassword) {
-                                panicError = "Секретный пароль должен отличаться от основного."
+                                panicError = "Задайте другой секретный пароль."
                                 panicBusy = false
                             } else if (isHiddenPassword) {
-                                panicError = "Секретный пароль должен отличаться от пароля дополнительного хранилища."
+                                panicError = "Задайте другой секретный пароль."
                                 panicBusy = false
                             } else {
                                 val saved = withContext(Dispatchers.IO) {
@@ -1945,7 +2047,7 @@ private fun SettingsScreen(
         }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("SecNote · версия 1.4.11", style = MaterialTheme.typography.labelMedium,
+            Text("SecNote · версия 1.4.14", style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Пакет: infernics.notes", style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1972,20 +2074,15 @@ private fun SettingsScreen(
             Spacer(Modifier.height(26.dp))
             Text("Безопасность", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            SettingRow(
-                title = "Дополнительное файловое хранилище",
-                subtitle = if (hiddenVaultConfigured)
-                    "Настроено. Используется отдельный пароль без биометрического входа."
-                else "Можно создать отдельную область с независимым паролем."
-            ) {
-                if (hiddenVaultConfigured) {
-                    Text("Настроено", color = MaterialTheme.colorScheme.primary,
-                        style = MaterialTheme.typography.labelMedium)
-                } else {
+            if (!hiddenVaultConfigured) {
+                SettingRow(
+                    title = "Дополнительное файловое хранилище",
+                    subtitle = "Можно создать отдельную область с независимым паролем."
+                ) {
                     TextButton(onClick = { showHiddenSetupDialog = true }) { Text("Настроить") }
                 }
+                Spacer(Modifier.height(18.dp))
             }
-            Spacer(Modifier.height(18.dp))
             SettingRow(
                 title = "Вход по отпечатку",
                 subtitle = when {
@@ -1999,7 +2096,8 @@ private fun SettingsScreen(
                 Switch(
                     checked = biometricEnabled,
                     enabled = biometricAvailable || biometricEnabled,
-                    onCheckedChange = { enabled -> onBiometricChange(enabled) { message = it } }
+                    onCheckedChange = { enabled -> onBiometricChange(enabled) { message = it } },
+                    colors = functionalSwitchColors
                 )
             }
             Spacer(Modifier.height(18.dp))
@@ -2009,7 +2107,11 @@ private fun SettingsScreen(
                     "Снимки экрана и запись экрана заблокированы для окна приложения"
                 else "Снимки экрана разрешены"
             ) {
-                Switch(checked = screenshotBlockingEnabled, onCheckedChange = onScreenshotBlockingChange)
+                Switch(
+                    checked = screenshotBlockingEnabled,
+                    onCheckedChange = onScreenshotBlockingChange,
+                    colors = functionalSwitchColors
+                )
             }
             Spacer(Modifier.height(18.dp))
             SettingRow(
@@ -2170,6 +2272,8 @@ private fun FileVaultScreen(
     var selectionMode by remember { mutableStateOf(false) }
     var confirmBatchDelete by remember { mutableStateOf(false) }
     var pendingBatchExportIds by remember { mutableStateOf<List<String>>(emptyList()) }
+    var showSearch by remember(storageDirectoryName) { mutableStateOf(false) }
+    var searchQuery by remember(storageDirectoryName) { mutableStateOf("") }
 
     BackHandler {
         if (selectionMode) {
@@ -2378,6 +2482,15 @@ private fun FileVaultScreen(
 
     val imageFiles = files.filter { it.isImageFile() }
     val otherFiles = files.filterNot { it.isImageFile() }
+    val filteredImageFiles = imageFiles.filter { item ->
+        PhotoDatePolicy.matches(item.name, item.dateTakenAt ?: item.addedAt, searchQuery)
+    }
+    val filteredOtherFiles = otherFiles.filter { item ->
+        PhotoDatePolicy.matches(item.name, item.addedAt, searchQuery)
+    }
+    val imageGroups = filteredImageFiles
+        .groupBy { item -> PhotoDatePolicy.dayKey(item.dateTakenAt ?: item.addedAt) }
+        .toSortedMap(compareByDescending { it })
     var selectedTab by remember(storageDirectoryName) { mutableStateOf(0) }
 
     Scaffold(
@@ -2419,6 +2532,15 @@ private fun FileVaultScreen(
                         }
                     }
                     if (!selectionMode) {
+                        IconButton(onClick = {
+                            showSearch = !showSearch
+                            if (!showSearch) searchQuery = ""
+                        }) {
+                            Icon(
+                                if (showSearch) Icons.Default.Close else Icons.Default.Search,
+                                contentDescription = if (showSearch) "Закрыть поиск" else "Поиск по названию или дате"
+                            )
+                        }
                         IconButton(onClick = onLock) {
                             Icon(Icons.Default.Lock, contentDescription = "Заблокировать")
                         }
@@ -2479,61 +2601,91 @@ private fun FileVaultScreen(
                     text = { Text("Документы (${otherFiles.size})") }
                 )
             }
+            if (showSearch) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
+                    singleLine = true,
+                    label = { Text("Название или дата") },
+                    placeholder = { Text("Например, 12.08.2026") },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Очистить поиск")
+                            }
+                        }
+                    }
+                )
+            }
             when {
                 loading || busy -> Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
-                selectedTab == 0 && imageFiles.isEmpty() -> Box(
+                selectedTab == 0 && filteredImageFiles.isEmpty() -> Box(
                     Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(28.dp)) {
                         Icon(Icons.Default.PhotoCamera, contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(38.dp))
                         Spacer(Modifier.height(10.dp))
-                        Text("Фотографий пока нет")
-                        Text("Сделайте снимок камерой или добавьте фотографию кнопкой «+».",
+                        Text(if (imageFiles.isEmpty()) "Фотографий пока нет" else "Ничего не найдено")
+                        Text(if (imageFiles.isEmpty()) "Сделайте снимок камерой или добавьте фотографию кнопкой «+»." else "Измените название или дату поиска.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall)
                     }
                 }
-                selectedTab == 1 && otherFiles.isEmpty() -> Box(
+                selectedTab == 1 && filteredOtherFiles.isEmpty() -> Box(
                     Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(28.dp)) {
                         Icon(Icons.Default.FolderOpen, contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(38.dp))
                         Spacer(Modifier.height(10.dp))
-                        Text("Документов пока нет")
-                        Text("Добавьте документ кнопкой «+».",
+                        Text(if (otherFiles.isEmpty()) "Документов пока нет" else "Ничего не найдено")
+                        Text(if (otherFiles.isEmpty()) "Добавьте документ кнопкой «+»." else "Измените название или дату поиска.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 selectedTab == 0 -> LazyColumn(
                     modifier = Modifier.weight(1f),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(9.dp)
                 ) {
-                    items(imageFiles.chunked(3), key = { row -> "images-${row.first().id}" }) { rowFiles ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(9.dp)
-                        ) {
-                            rowFiles.forEach { item ->
-                                VaultImageTile(
-                                    item = item,
-                                    repository = repository,
-                                    modifier = Modifier.weight(1f),
-                                    selected = item.id in selectedIds,
-                                    selectionMode = selectionMode,
-                                    onToggleSelection = { toggleSelection(item.id) },
-                                    onLongSelect = { toggleSelection(item.id) },
-                                    onPreview = { previewTarget = item },
-                                    onExport = { requestExport(item) },
-                                    onDelete = { deleteTarget = item }
-                                )
+                    imageGroups.forEach { (dayKey, dayFiles) ->
+                        item(key = "photo-date-$dayKey") {
+                            Text(
+                                PhotoDatePolicy.groupLabel(dayKey),
+                                modifier = Modifier.fillMaxWidth().padding(start = 2.dp, top = 8.dp, bottom = 2.dp),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        items(
+                            dayFiles.sortedByDescending { it.dateTakenAt ?: it.addedAt }.chunked(3),
+                            key = { row -> "images-${row.first().id}" }
+                        ) { rowFiles ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(9.dp)
+                            ) {
+                                rowFiles.forEach { item ->
+                                    VaultImageTile(
+                                        item = item,
+                                        repository = repository,
+                                        modifier = Modifier.weight(1f),
+                                        selected = item.id in selectedIds,
+                                        selectionMode = selectionMode,
+                                        onToggleSelection = { toggleSelection(item.id) },
+                                        onLongSelect = { toggleSelection(item.id) },
+                                        onPreview = { previewTarget = item },
+                                        onExport = { requestExport(item) },
+                                        onDelete = { deleteTarget = item }
+                                    )
+                                }
+                                repeat(3 - rowFiles.size) { Spacer(Modifier.weight(1f)) }
                             }
-                            repeat(3 - rowFiles.size) { Spacer(Modifier.weight(1f)) }
                         }
                     }
                 }
@@ -2542,7 +2694,7 @@ private fun FileVaultScreen(
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    items(otherFiles, key = { it.id }) { item ->
+                    items(filteredOtherFiles, key = { it.id }) { item ->
                         VaultDocumentRow(
                             item = item,
                             selected = item.id in selectedIds,
