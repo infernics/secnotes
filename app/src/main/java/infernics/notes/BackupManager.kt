@@ -41,6 +41,16 @@ internal class BackupRestoreException(
     cause: Throwable? = null
 ) : Exception(message, cause)
 
+/** Validates the two independent secrets needed by the version-1 backup format. */
+internal object BackupImportInputValidation {
+    fun error(backupPassword: String, sourceMainPassword: String): String? = when {
+        backupPassword.length < 12 -> "Введите пароль резервной копии (не менее 12 символов)."
+        sourceMainPassword.length < 8 -> "Введите прежний основной пароль SecNote, которым пользовались при создании этой копии (не менее 8 символов). Новый пароль после очистки данных не подойдёт."
+        backupPassword == sourceMainPassword -> "Пароль архива и прежний основной пароль должны отличаться."
+        else -> null
+    }
+}
+
 /** Rules for backup entry names are kept pure so they can be tested on the JVM. */
 internal object BackupArchiveRules {
     private val simpleEncryptedName = Regex("[A-Za-z0-9_-]{1,128}\\.enc")
@@ -216,11 +226,11 @@ internal object BackupManager {
         currentCrypto: Crypto,
         source: Uri,
         backupPassword: String,
-        sourceMainPassword: String
+        sourceMainPassword: String,
+        onProgress: (String) -> Unit = {}
     ): BackupRestoreResult {
-        require(backupPassword.length >= 12) { "Пароль резервной копии должен содержать не менее 12 символов." }
-        require(sourceMainPassword.length >= 8) { "Введите основной пароль, использовавшийся при создании копии." }
-        require(backupPassword != sourceMainPassword) { "Пароль резервной копии должен отличаться от основного пароля." }
+        BackupImportInputValidation.error(backupPassword, sourceMainPassword)?.let { error(it) }
+        fun progress(stage: String) { runCatching { onProgress(stage) } }
 
         val oldSessionKey = currentCrypto.exportKeyForBiometricWrapping()
         val transaction = File(context.noBackupFilesDir, "secnote_restore_${UUID.randomUUID()}")
@@ -231,22 +241,27 @@ internal object BackupManager {
         var primarySalt: ByteArray? = null
 
         try {
+            progress("Подготавливаю временную область восстановления…")
             check(payload.mkdirs()) { "Не удалось подготовить временную область восстановления." }
+            progress("Проверяю пароль и целостность архива…")
             val extractedManifest = decryptAndStage(context, source, backupPassword, payload).also { manifest ->
                 primarySalt = Base64.decode(manifest.getString("mainSalt"), Base64.NO_WRAP)
             }
             val salt = primarySalt ?: error("В резервной копии отсутствует соль основного ключа.")
             require(salt.size == 16) { "Некорректный формат основного ключа в резервной копии." }
             val settings = parseSettings(extractedManifest.getJSONObject("settings"))
+            progress("Проверяю прежний основной пароль, заметки и файлы…")
             validateVaultPayload(payload, salt, sourceMainPassword)
 
             val hiddenConfigured = File(payload, "hidden/${HiddenVault.METADATA_FILE_NAME}").isFile
             val panicConfigured = File(payload, "security/panic.credential").isFile
 
+            progress("Готовлю безопасный откат текущих данных…")
             StorageGate.blockAndDrain()
             gateBlocked = true
             snapshotCurrentState(context, rollback)
             writeRestoreMarker(context, transaction.name)
+            progress("Восстанавливаю заметки и файлы…")
             Crypto.destroyAll()
             keysDestroyed = true
 
@@ -254,13 +269,16 @@ internal object BackupManager {
             val restoredCrypto = Crypto.fromPassphrase(sourceMainPassword, salt)
             try {
                 Vault.installPortableState(context, salt, restoredCrypto)
+                progress("Восстанавливаю настройки…")
                 AppPreferences.applyBackupSettings(context, settings)
                 BiometricVault.disable(context) // Android Keystore biometric wrappers cannot move between devices.
                 StorageGate.resumeAfterUnlock()
+                progress("Завершаю восстановление…")
                 val marker = File(context.noBackupFilesDir, RESTORE_MARKER)
                 check(!marker.exists() || marker.delete()) { "Не удалось завершить транзакцию восстановления." }
                 gateBlocked = false
                 deleteTreeBestEffort(transaction)
+                progress("Готово")
                 return BackupRestoreResult(
                     crypto = restoredCrypto,
                     settings = settings,

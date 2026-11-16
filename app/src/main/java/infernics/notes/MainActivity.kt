@@ -1462,6 +1462,9 @@ private fun SettingsScreen(
     var backupExportRepeat by remember { mutableStateOf("") }
     var backupImportPassword by remember { mutableStateOf("") }
     var backupSourceMainPassword by remember { mutableStateOf("") }
+    var backupImportError by remember { mutableStateOf<String?>(null) }
+    var backupImportProgress by remember { mutableStateOf<String?>(null) }
+    var backupStatus by remember { mutableStateOf<String?>(null) }
     var pendingExportPassword by remember { mutableStateOf<String?>(null) }
     var pendingBackupUri by remember { mutableStateOf<Uri?>(null) }
     var backupBusy by remember { mutableStateOf(false) }
@@ -1519,6 +1522,9 @@ private fun SettingsScreen(
             pendingBackupUri = uri
             backupImportPassword = ""
             backupSourceMainPassword = ""
+            backupImportError = null
+            backupImportProgress = null
+            backupStatus = null
             showBackupImportDialog = true
         }
     }
@@ -1530,7 +1536,7 @@ private fun SettingsScreen(
             title = { Text("Создать резервную копию") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Архив включает заметки, файлы и фотографии основного и дополнительного хранилищ, а также настройки. Он защищён отдельным паролем не короче 12 символов, который не должен совпадать с основным, дополнительным или секретным паролем уничтожения. Пароль дополнительного хранилища в архив не записывается — после переноса потребуется тот же пароль, который вы помните.", style = MaterialTheme.typography.bodySmall)
+                    Text("Архив включает заметки, файлы и фотографии основного и дополнительного хранилищ, а также настройки. Он защищён отдельным паролем не короче 12 символов, который не должен совпадать с основным, дополнительным или секретным паролем уничтожения. Для будущего импорта понадобятся этот пароль архива и прежний основной пароль SecNote, действовавший на момент создания копии. Пароль дополнительного хранилища в архив не записывается — после переноса потребуется тот же пароль, который вы помните.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = backupExportPassword,
                         onValueChange = { backupExportPassword = it },
@@ -1578,15 +1584,18 @@ private fun SettingsScreen(
 
     if (showBackupImportDialog) {
         AlertDialog(
-            onDismissRequest = { if (!backupBusy) { showBackupImportDialog = false; backupImportPassword = ""; backupSourceMainPassword = ""; pendingBackupUri = null } },
+            onDismissRequest = { if (!backupBusy) { showBackupImportDialog = false; backupImportPassword = ""; backupSourceMainPassword = ""; backupImportError = null; backupImportProgress = null; pendingBackupUri = null } },
             title = { Text("Восстановить резервную копию") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Сначала проверяются пароль архива и целостность всех файлов. Затем данные текущего приложения заменяются содержимым копии. Введите отдельный пароль архива и основной пароль, действовавший при создании копии. Пароль дополнительного хранилища не переносится и не требуется для импорта, но останется прежним — он понадобится для последующего открытия этого хранилища. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
+                Column(
+                    modifier = Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("Для этой версии архива нужны ДВА разных пароля. Первый — отдельный пароль резервной копии, заданный при экспорте (не менее 12 символов). Второй — ПРЕЖНИЙ основной пароль SecNote, которым были зашифрованы данные в момент создания копии (не менее 8 символов). Если после очистки данных вы создали новое пустое хранилище, пароль от него не подойдёт: укажите прежний пароль из исходного приложения. Пароль дополнительного хранилища не переносится и не нужен для импорта; после восстановления его по-прежнему нужно помнить. Биометрическая привязка к прежнему устройству не переносится.", style = MaterialTheme.typography.bodySmall)
                     OutlinedTextField(
                         value = backupImportPassword,
-                        onValueChange = { backupImportPassword = it },
-                        label = { Text("Пароль резервной копии") },
+                        onValueChange = { backupImportPassword = it; backupImportError = null },
+                        label = { Text("1. Пароль резервной копии (12+ символов)") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -1594,24 +1603,38 @@ private fun SettingsScreen(
                     )
                     OutlinedTextField(
                         value = backupSourceMainPassword,
-                        onValueChange = { backupSourceMainPassword = it },
-                        label = { Text("Основной пароль из копии") },
+                        onValueChange = { backupSourceMainPassword = it; backupImportError = null },
+                        label = { Text("2. Прежний основной пароль SecNote (8+ символов)") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         enabled = !backupBusy
                     )
+                    if (backupBusy && backupImportProgress != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Text(backupImportProgress!!, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    if (backupImportError != null) {
+                        Text(backupImportError!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             },
             confirmButton = {
                 TextButton(
-                    enabled = !backupBusy && backupImportPassword.length >= 12 && backupSourceMainPassword.length >= 8 && pendingBackupUri != null,
+                    enabled = !backupBusy && pendingBackupUri != null,
                     onClick = {
                         val uri = pendingBackupUri ?: return@TextButton
                         val backupPassword = backupImportPassword
                         val mainPassword = backupSourceMainPassword
-                        backupImportPassword = ""
-                        backupSourceMainPassword = ""
+                        val validationError = BackupImportInputValidation.error(backupPassword, mainPassword)
+                        if (validationError != null) {
+                            backupImportError = validationError
+                            return@TextButton
+                        }
+                        backupImportError = null
+                        backupImportProgress = "Запускаю проверку…"
                         backupBusy = true
                         activity.backupOperationInProgress = true
                         scope.launch {
@@ -1619,17 +1642,30 @@ private fun SettingsScreen(
                                 val result = runCatching {
                                     NoteSaveQueue.awaitIdle()
                                     withContext(Dispatchers.IO) {
-                                        BackupManager.restoreBackup(context, currentCrypto, uri, backupPassword, mainPassword)
+                                        BackupManager.restoreBackup(
+                                            context, currentCrypto, uri, backupPassword, mainPassword,
+                                            onProgress = { stage -> activity.runOnUiThread { backupImportProgress = stage } }
+                                        )
                                     }
                                 }
-                                showBackupImportDialog = false
-                                pendingBackupUri = null
                                 result.onSuccess { restored ->
                                     onBackupRestored(restored)
+                                    showBackupImportDialog = false
+                                    pendingBackupUri = null
+                                    backupImportPassword = ""
+                                    backupSourceMainPassword = ""
+                                    backupImportProgress = null
+                                    backupStatus = "Резервная копия успешно восстановлена. Биометрию можно включить заново."
                                     message = "Резервная копия восстановлена. Биометрию можно включить заново на этом устройстве."
                                 }.onFailure { error ->
                                     (error as? BackupRestoreException)?.recoveredSessionCrypto?.let(onBackupSessionRecovered)
-                                    message = "Не удалось восстановить резервную копию: ${error.message ?: "ошибка"}"
+                                    val detail = generateSequence(error as Throwable?) { it.cause }
+                                        .mapNotNull { it.message?.takeIf(String::isNotBlank) }
+                                        .firstOrNull() ?: error.javaClass.simpleName
+                                    backupImportError = "Восстановление не выполнено: $detail"
+                                    backupImportProgress = null
+                                    backupImportPassword = ""
+                                    backupSourceMainPassword = ""
                                 }
                             } finally {
                                 backupPassword.toCharArray().fill('\u0000')
@@ -1639,13 +1675,15 @@ private fun SettingsScreen(
                             }
                         }
                     }
-                ) { if (backupBusy) Text("Проверка…") else Text("Проверить и восстановить") }
+                ) { if (backupBusy) Text("Восстановление…") else Text("Проверить и восстановить") }
             },
             dismissButton = {
                 TextButton(enabled = !backupBusy, onClick = {
                     showBackupImportDialog = false
                     backupImportPassword = ""
                     backupSourceMainPassword = ""
+                    backupImportError = null
+                    backupImportProgress = null
                     pendingBackupUri = null
                 }) { Text("Отмена") }
             }
@@ -2007,7 +2045,7 @@ private fun SettingsScreen(
             Text("Резервное копирование", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             Text(
-                "Создайте переносимый зашифрованный архив или восстановите данные из копии на этом устройстве. Архив защищён отдельным паролем; для восстановления также потребуется исходный основной пароль.",
+                "Создайте переносимый зашифрованный архив или восстановите данные. При импорте нужны пароль архива и прежний основной пароль SecNote, действовавший при создании копии.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall
             )
@@ -2034,6 +2072,10 @@ private fun SettingsScreen(
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                     Text("Обработка резервной копии…", style = MaterialTheme.typography.bodySmall)
                 }
+            }
+            if (backupStatus != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(backupStatus!!, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
             }
             Spacer(Modifier.height(25.dp))
             Text("Хранилище", style = MaterialTheme.typography.titleMedium)

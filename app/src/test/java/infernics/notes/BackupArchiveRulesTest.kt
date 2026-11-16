@@ -50,3 +50,27 @@ class BackupArchiveRulesTest {
         )
     }
 }
+
+class BackupImportInputValidationTest {
+    @Test
+    fun requiresTheSeparateBackupPasswordAndOriginalMainPassword() {
+        assertTrue(BackupImportInputValidation.error("", "")!!.contains("пароль резервной копии"))
+        assertTrue(
+            BackupImportInputValidation.error("backup-passphrase-1", "")!!
+                .contains("прежний основной пароль")
+        )
+        assertTrue(BackupImportInputValidation.error("backup-passphrase-1", "samepassword") == null)
+    }
+
+    @Test
+    fun rejectsUsingTheSamePasswordForBothFields() {
+        val password = "long-distinct-password"
+        assertTrue(BackupImportInputValidation.error(password, password)!!.contains("должны отличаться"))
+    }
+
+    @Test
+    fun rejectsNewBlankVaultPasswordWhenItIsTooShortForLegacyContentKey() {
+        val error = BackupImportInputValidation.error("backup-passphrase-1", "newpass")
+        assertTrue(error != null && error.contains("Новый пароль после очистки данных не подойдёт"))
+    }
+}
