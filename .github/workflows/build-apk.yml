@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Test and build SecNote 1.4.13
+    name: Test and build SecNote 1.4.14
     runs-on: ubuntu-latest
 
     steps:
@@ -69,6 +69,7 @@ jobs:
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/CameraCaptureScreen.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/ThumbnailDecodePolicy.kt"
+          test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/PhotoDatePolicy.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
           test -f "$PROJECT_DIR/app/src/main/java/infernics/notes/AutoLockPolicy.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/PanicCredentialTest.kt"
@@ -78,11 +79,13 @@ jobs:
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/ThumbnailDecodePolicyTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/CryptoTest.kt"
           test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
+          test -f "$PROJECT_DIR/app/src/test/java/infernics/notes/PhotoDatePolicyTest.kt"
           grep -Fq 'persistedVerifierDoesNotContainThePassphrase' "$PROJECT_DIR/app/src/test/java/infernics/notes/HiddenVaultTest.kt"
           grep -Fq 'internal fun createRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
           grep -Fq 'internal fun verifyRecord' "$PROJECT_DIR/app/src/main/java/infernics/notes/PanicCredential.kt"
           grep -Fq 'applicationId = "infernics.notes"' "$BUILD_FILE"
           grep -Fq 'compileSdk = 35' "$BUILD_FILE"
+          grep -Fq 'androidx.exifinterface:exifinterface:1.3.7' "$BUILD_FILE"
           grep -Fq 'id("com.android.application") version "8.6.1" apply false' "$PROJECT_DIR/build.gradle.kts"
           grep -Fq 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.7' "$BUILD_FILE"
           grep -Fq 'androidx.camera:camera-core:1.5.3' "$BUILD_FILE"
@@ -90,8 +93,8 @@ jobs:
           grep -Fq 'androidx.camera:camera-lifecycle:1.5.3' "$BUILD_FILE"
           grep -Fq 'androidx.camera:camera-view:1.5.3' "$BUILD_FILE"
           grep -Fq 'namespace = "infernics.notes"' "$BUILD_FILE"
-          grep -Fq 'versionCode = 21' "$BUILD_FILE"
-          grep -Fq 'versionName = "1.4.13"' "$BUILD_FILE"
+          grep -Fq 'versionCode = 22' "$BUILD_FILE"
+          grep -Fq 'versionName = "1.4.14"' "$BUILD_FILE"
           grep -Fq 'SecNoteVaultSaltKey' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'fun matchesPassphrase' "$PROJECT_DIR/app/src/main/java/infernics/notes/Vault.kt"
           grep -Fq 'StorageGate.blockAndDrain()' "$PROJECT_DIR/app/src/main/java/infernics/notes/EmergencyWipe.kt"
@@ -204,7 +207,24 @@ jobs:
           grep -Fq 'validatesPairedFilePayloads' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
           grep -Fq 'requiresBothNonEmptyPasswordsButHasNoMinimumLength' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
           grep -Fq 'rejectsUsingTheSamePasswordForBothFields' "$PROJECT_DIR/app/src/test/java/infernics/notes/BackupArchiveRulesTest.kt"
-          echo "Verified: infernics.notes, SecNote 1.4.13 (code 21), no password length minimums, hidden-only emergency wipe, photo/document tabs, encrypted portable backup/restore, primary and secondary encrypted stores"
+          grep -Fq 'if (!hiddenVaultConfigured)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          ! grep -Fq 'дополнительного хранилища' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          ! grep -Fq 'дополнительного хранилища' "$PROJECT_DIR/app/src/main/java/infernics/notes/BackupManager.kt"
+          grep -Fq 'SwitchDefaults.colors(' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'uncheckedTrackColor = if (darkTheme)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq '.animateItem()' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'PhotoDatePolicy.matches' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'PhotoDatePolicy.groupLabel(dayKey)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'dateTakenAt = originalPhotoDate' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          grep -Fq 'resolveLegacyPhotoDate(item)' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          grep -Fq 'PhotoDatePolicy.parseExifTimestamp' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          ! grep -Fq 'saveAttributes()' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          ! grep -Fq 'setAttribute(' "$PROJECT_DIR/app/src/main/java/infernics/notes/FileVaultRepository.kt"
+          grep -Fq 'setInitialBiometricOfferPending(context, true)' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'Включить биометрический вход?' "$PROJECT_DIR/app/src/main/java/infernics/notes/MainActivity.kt"
+          grep -Fq 'isInitialBiometricOfferPending' "$PROJECT_DIR/app/src/main/java/infernics/notes/AppPreferences.kt"
+          grep -Fq 'sourceDateCanRemainDifferentFromImportDate' "$PROJECT_DIR/app/src/test/java/infernics/notes/PhotoDatePolicyTest.kt"
+          echo "Verified: infernics.notes, SecNote 1.4.14 (code 22), hidden-settings removal, dark functional switch palette, animated note reorder, photo capture-date grouping/search, and first-setup biometric offer; image metadata is read-only"
 
       - name: Run unit tests and build APK
         run: gradle -p "${{ steps.project.outputs.dir }}" clean testDebugUnitTest assembleDebug --no-daemon --stacktrace
