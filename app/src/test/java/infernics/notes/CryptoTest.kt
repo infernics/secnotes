@@ -232,6 +232,42 @@ class CryptoTest {
     }
 
     @Test
+    fun legacyStreamCanBeMigratedToContextBoundFormat() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val original = ByteArray(180_000) { (it % 227).toByte() }
+        val legacy = ByteArrayOutputStream()
+        crypto.encryptStream(ByteArrayInputStream(original), legacy)
+
+        val context = Crypto.contextAad("file-data", "migrated-file")
+        val plaintext = ByteArrayOutputStream()
+        crypto.decryptStream(ByteArrayInputStream(legacy.toByteArray()), plaintext, context)
+        val migrated = ByteArrayOutputStream()
+        crypto.encryptStream(ByteArrayInputStream(plaintext.toByteArray()), migrated, context)
+
+        val migratedBytes = migrated.toByteArray()
+        assertArrayEquals(byteArrayOf(0x53, 0x4E, 0x46, 0x32), migratedBytes.copyOfRange(0, 4))
+        val restored = ByteArrayOutputStream()
+        crypto.decryptStream(ByteArrayInputStream(migratedBytes), restored, context)
+        assertArrayEquals(original, restored.toByteArray())
+
+        try {
+            crypto.decryptStream(
+                ByteArrayInputStream(migratedBytes),
+                ByteArrayOutputStream(),
+                Crypto.contextAad("file-data", "different-file")
+            )
+            fail("Migrated content must be bound to its original file ID")
+        } catch (_: Exception) {
+            // Expected: the new stream is authenticated with its object context.
+        } finally {
+            context.fill(0)
+            original.fill(0)
+            plaintext.toByteArray().fill(0)
+            migratedBytes.fill(0)
+        }
+    }
+
+    @Test
     fun legacyFileStreamRemainsReadableThroughContextAwareApi() {
         val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
         val original = ByteArray(90_000) { (it % 233).toByte() }

@@ -76,9 +76,13 @@ class FileVaultRepository(
 
     init {
         StorageGate.withAccess(generation) {
+            // Recover a migration interrupted after the original ciphertext was moved
+            // aside. The backup is retained until the replacement has been authenticated.
+            recoverMigrationBackupsWithoutTarget()
             // Remove leftovers from interrupted imports/exports. Cache files may contain
             // short-lived plaintext, so use best-effort overwrite before deleting them.
-            root.listFiles { file -> file.name.endsWith(".tmp") }?.forEach(::overwriteAndDelete)
+            root.listFiles { file -> file.name.endsWith(".tmp") || file.name.endsWith(".migrate.tmp") }
+                ?.forEach(::overwriteAndDelete)
             context.cacheDir.listFiles { file ->
                 file.name.startsWith("$cachePrefix-export-") ||
                     file.name.startsWith("$cachePrefix-thumbnail-") ||
@@ -96,6 +100,7 @@ class FileVaultRepository(
                 runCatching { readMetadata(id) }.getOrNull()
             }
             .map { item ->
+                runCatching { migrateLegacyStream(item) }
                 if (item.isPhotoLike() && !item.photoDateResolved) resolveLegacyPhotoDate(item) else item
             }
             .sortedByDescending { it.addedAt }
@@ -397,8 +402,141 @@ class FileVaultRepository(
         removed
     }
 
+    /**
+     * Convert a legacy SNF1 vault stream to context-bound SNF2 without ever replacing
+     * the only verified copy. Plaintext exists only in a private cache temp file and is
+     * overwritten on every exit path. Migration is best-effort: a failure leaves SNF1
+     * intact and readable, and the next vault listing retries it.
+     */
+    private fun migrateLegacyStream(item: VaultFile) {
+        val source = dataFile(item.id)
+        if (!source.isFile || isContextualStream(source)) {
+            recoverCompletedMigration(item)
+            return
+        }
+
+        val plaintext = File.createTempFile("$cachePrefix-migration-", ".tmp", context.cacheDir)
+        val encryptedTemp = File(root, "${item.id}.data.migrate.tmp")
+        val backup = File(root, "${item.id}.data.migrate.bak")
+        val digest = MessageDigest.getInstance("SHA-256")
+        try {
+            val decryptedSize = source.inputStream().use { encryptedInput ->
+                FileOutputStream(plaintext, false).use { plainOutput ->
+                    val size = crypto.decryptStream(
+                        encryptedInput,
+                        DigestOutputStream(plainOutput, digest),
+                        Crypto.contextAad("file-data", item.id)
+                    )
+                    plainOutput.fd.sync()
+                    size
+                }
+            }
+            check(decryptedSize == item.sizeBytes && plaintext.length() == item.sizeBytes) {
+                "Размер старого файла не совпадает с метаданными; миграция отменена."
+            }
+            val expectedDigest = digest.digest()
+            try {
+                plaintext.inputStream().use { plainInput ->
+                    FileOutputStream(encryptedTemp, false).use { encryptedOutput ->
+                        crypto.encryptStream(
+                            plainInput,
+                            encryptedOutput,
+                            Crypto.contextAad("file-data", item.id)
+                        )
+                        encryptedOutput.fd.sync()
+                    }
+                }
+                check(isContextualStream(encryptedTemp)) { "Новый формат файла не создан." }
+                verifyEncryptedFile(encryptedTemp, item.id, item.sizeBytes, expectedDigest)
+
+                check(!backup.exists()) { "Обнаружена незавершённая миграция; исходный файл сохранён." }
+                check(source.renameTo(backup)) { "Не удалось сохранить исходный файл перед миграцией." }
+                syncVaultDirectory()
+                try {
+                    check(encryptedTemp.renameTo(source)) { "Не удалось установить новый формат файла." }
+                    syncVaultDirectory()
+                    verifyEncryptedFile(source, item.id, item.sizeBytes, expectedDigest)
+                    check(isContextualStream(source)) { "После замены обнаружен неожиданный формат файла." }
+                } catch (error: Exception) {
+                    // Roll back to the untouched original whenever the replacement
+                    // cannot be fully verified.
+                    if (source.exists()) overwriteAndDelete(source)
+                    if (backup.exists() && !backup.renameTo(source)) {
+                        error.addSuppressed(IllegalStateException("Не удалось восстановить исходный зашифрованный файл."))
+                    }
+                    runCatching { syncVaultDirectory() }.onFailure(error::addSuppressed)
+                    throw error
+                }
+                // Cleanup is deliberately outside the rollback block. Once the new
+                // file is verified and synced, a cleanup failure must never delete it.
+                // A leftover backup is recognized and finalized on the next access.
+                runCatching {
+                    overwriteAndDelete(backup)
+                    syncVaultDirectory()
+                }
+            } finally {
+                expectedDigest.fill(0)
+            }
+        } finally {
+            overwriteAndDelete(plaintext)
+            overwriteAndDelete(encryptedTemp)
+        }
+    }
+
+    /** If a process stopped after installing SNF2 but before deleting its backup, finish safely. */
+    private fun recoverCompletedMigration(item: VaultFile) {
+        val backup = File(root, "${item.id}.data.migrate.bak")
+        val source = dataFile(item.id)
+        if (!backup.exists()) return
+        try {
+            val size = source.inputStream().use { input ->
+                crypto.decryptStream(input, DiscardOutputStream, Crypto.contextAad("file-data", item.id))
+            }
+            check(isContextualStream(source) && size == item.sizeBytes) {
+                "Новая копия не прошла проверку; исходная резервная копия сохранена."
+            }
+            overwriteAndDelete(backup)
+            syncVaultDirectory()
+        } catch (error: Exception) {
+            if (backup.exists()) {
+                if (source.exists()) overwriteAndDelete(source)
+                check(backup.renameTo(source)) { "Не удалось восстановить исходный файл после прерванной миграции." }
+                syncVaultDirectory()
+            }
+            throw error
+        }
+    }
+
+    /** Restore backups when a crash happened between moving the source and installing SNF2. */
+    private fun recoverMigrationBackupsWithoutTarget() {
+        root.listFiles { file -> file.name.endsWith(".data.migrate.bak") }.orEmpty().forEach { backup ->
+            val id = backup.name.removeSuffix(".data.migrate.bak")
+            val target = dataFile(id)
+            if (!target.exists()) {
+                check(backup.renameTo(target)) { "Не удалось восстановить исходный файл после прерванной миграции." }
+            }
+        }
+        if (root.listFiles { file -> file.name.endsWith(".data.migrate.bak") }.orEmpty().isNotEmpty()) {
+            syncVaultDirectory()
+        }
+    }
+
+    private fun isContextualStream(file: File): Boolean = runCatching {
+        file.inputStream().use { input ->
+            val header = ByteArray(4)
+            var offset = 0
+            while (offset < header.size) {
+                val count = input.read(header, offset, header.size - offset)
+                if (count < 0) return@use false
+                offset += count
+            }
+            header.contentEquals(byteArrayOf(0x53, 0x4E, 0x46, 0x32))
+        }
+    }.getOrDefault(false)
+
     /** Decrypt into a private temp file, then stream the verified data to the destination. */
     private fun exportVerified(item: VaultFile, destination: Uri) {
+        migrateLegacyStream(item)
         val verifiedPlaintext = File.createTempFile("$cachePrefix-export-", ".tmp", context.cacheDir)
         try {
             val decryptedSize = dataFile(item.id).inputStream().use { encryptedInput ->
@@ -431,6 +569,7 @@ class FileVaultRepository(
         var temporaryPlaintext: File? = null
         try {
             val metadata = readMetadata(id)
+            migrateLegacyStream(metadata)
             // Avoid attempting to decode unbounded or unexpectedly huge inputs into memory.
             if (metadata.sizeBytes !in 1L..(160L * 1024L * 1024L)) return@withAccess null
             val encryptedFile = dataFile(id)
@@ -572,6 +711,7 @@ class FileVaultRepository(
             photoDateResolved = json.optBoolean("photoDateResolved", json.has("dateTakenAt"))
         ).also { item ->
             if (legacy) runCatching { writeMetadataAtomically(item) }
+            runCatching { recoverCompletedMigration(item) }
         }
     }
 
@@ -719,8 +859,8 @@ class FileVaultRepository(
 
     private fun cleanupOrphans() {
         val files = root.listFiles().orEmpty()
-        val dataIds = files.filter { it.name.endsWith(".data.enc") }
-            .map { it.name.removeSuffix(".data.enc") }.toSet()
+        val dataIds = files.filter { it.name.endsWith(".data.enc") || it.name.endsWith(".data.migrate.bak") }
+            .map { it.name.removeSuffix(".data.migrate.bak").removeSuffix(".data.enc") }.toSet()
         // A crash during AtomicFile metadata replacement can leave only .meta.enc.bak.
         // Treat that recoverable previous record as present; otherwise cleanup could
         // delete its still-valid encrypted data before AtomicFile gets a chance to recover.
@@ -729,7 +869,11 @@ class FileVaultRepository(
         }.map {
             it.name.removeSuffix(".bak").removeSuffix(".meta.enc")
         }.toSet()
-        (dataIds - metadataIds).forEach { overwriteAndDelete(dataFile(it)) }
+        (dataIds - metadataIds).forEach { id ->
+            overwriteAndDelete(dataFile(id))
+            overwriteAndDelete(File(root, "$id.data.migrate.bak"))
+            overwriteAndDelete(File(root, "$id.data.migrate.tmp"))
+        }
         (metadataIds - dataIds).forEach { overwriteAndDelete(metadataFile(it)) }
     }
 
@@ -737,8 +881,8 @@ class FileVaultRepository(
         /** Removes plaintext temp files left by a process crash before any vault is opened. */
         fun cleanupAbandonedTemporaryFiles(context: Context) {
             val prefixes = listOf(
-                "secnote-export-", "secnote-thumbnail-", "secnote-date-",
-                "media-export-", "media-thumbnail-", "media-date-"
+                "secnote-export-", "secnote-thumbnail-", "secnote-date-", "secnote-migration-",
+                "media-export-", "media-thumbnail-", "media-date-", "media-migration-"
             )
             context.cacheDir.listFiles { file -> prefixes.any { prefix -> file.name.startsWith(prefix) } }
                 ?.forEach(::overwriteAndDeleteTemporary)
