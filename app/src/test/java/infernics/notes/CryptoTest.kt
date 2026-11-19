@@ -158,4 +158,42 @@ class CryptoTest {
         } catch (_: Exception) { }
     }
 
+    @Test
+    fun contextualRecordCannotBeMovedBetweenObjects() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val firstContext = Crypto.contextAad("note-record", "note-one")
+        val secondContext = Crypto.contextAad("note-record", "note-two")
+        val differentDomain = Crypto.contextAad("file-metadata", "note-one")
+        val encrypted = crypto.encrypt("private note", firstContext)
+        assertEquals("private note", crypto.decryptToText(encrypted, firstContext))
+        try {
+            crypto.decryptToText(encrypted, secondContext)
+            fail("Ciphertext must not authenticate under a different object ID")
+        } catch (_: Exception) {
+            // Expected: GCM AAD verification rejects cross-object substitution.
+        }
+        try {
+            crypto.decryptToText(encrypted, differentDomain)
+            fail("Ciphertext must not authenticate under a different record domain")
+        } catch (_: Exception) {
+            // Expected: GCM AAD verification rejects cross-domain substitution.
+        } finally {
+            firstContext.fill(0)
+            secondContext.fill(0)
+            differentDomain.fill(0)
+            encrypted.fill(0)
+        }
+    }
+
+    @Test
+    fun legacyRecordRemainsReadableForMigration() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val legacy = crypto.encrypt("legacy record")
+        val context = Crypto.contextAad("note-record", "legacy-id")
+        assertEquals(false, crypto.isContextualRecord(legacy))
+        assertEquals("legacy record", crypto.decryptToText(legacy, context))
+        context.fill(0)
+        legacy.fill(0)
+    }
+
 }

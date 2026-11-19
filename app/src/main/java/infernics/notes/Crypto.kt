@@ -35,21 +35,78 @@ class Crypto private constructor(rawKey: ByteArray) {
 
     fun encrypt(plain: ByteArray): ByteArray {
         val iv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
-        val cipher = newCipher(Cipher.ENCRYPT_MODE, iv)
-        return iv + cipher.doFinal(plain)
+        return try {
+            val cipher = newCipher(Cipher.ENCRYPT_MODE, iv)
+            iv + cipher.doFinal(plain)
+        } finally {
+            iv.fill(0)
+        }
     }
 
     fun decrypt(blob: ByteArray): ByteArray {
         require(blob.size >= IV_LEN + TAG_LEN_BYTES) { "Encrypted data is incomplete" }
         val iv = blob.copyOfRange(0, IV_LEN)
-        val cipher = newCipher(Cipher.DECRYPT_MODE, iv)
-        return cipher.doFinal(blob, IV_LEN, blob.size - IV_LEN)
+        return try {
+            val cipher = newCipher(Cipher.DECRYPT_MODE, iv)
+            cipher.doFinal(blob, IV_LEN, blob.size - IV_LEN)
+        } finally {
+            iv.fill(0)
+        }
+    }
+
+    /** New record envelope: authenticated context binds ciphertext to its logical owner. */
+    fun encrypt(plain: ByteArray, aad: ByteArray): ByteArray {
+        val iv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
+        val cipher = newCipher(Cipher.ENCRYPT_MODE, iv).apply { updateAAD(aad) }
+        val encrypted = cipher.doFinal(plain)
+        return try {
+            RECORD_MAGIC + iv + encrypted
+        } finally {
+            iv.fill(0)
+            encrypted.fill(0)
+        }
+    }
+
+    /**
+     * Reads both the new context-bound envelope and the legacy IV+ciphertext format.
+     * Legacy records are accepted only to support in-place migration by their owner.
+     */
+    fun decrypt(blob: ByteArray, aad: ByteArray): ByteArray {
+        if (!isContextualRecord(blob)) return decrypt(blob)
+        require(blob.size >= RECORD_MAGIC.size + IV_LEN + TAG_LEN_BYTES) { "Encrypted data is incomplete" }
+        val ivOffset = RECORD_MAGIC.size
+        val iv = blob.copyOfRange(ivOffset, ivOffset + IV_LEN)
+        return try {
+            val cipher = newCipher(Cipher.DECRYPT_MODE, iv).apply { updateAAD(aad) }
+            cipher.doFinal(blob, ivOffset + IV_LEN, blob.size - ivOffset - IV_LEN)
+        } finally {
+            iv.fill(0)
+        }
+    }
+
+    fun isContextualRecord(blob: ByteArray): Boolean {
+        if (blob.size < RECORD_MAGIC.size) return false
+        for (index in RECORD_MAGIC.indices) {
+            if (blob[index] != RECORD_MAGIC[index]) return false
+        }
+        return true
     }
 
     fun encrypt(text: String): ByteArray = encrypt(text.toByteArray(Charsets.UTF_8))
 
+    fun encrypt(text: String, aad: ByteArray): ByteArray = encrypt(text.toByteArray(Charsets.UTF_8), aad)
+
     fun decryptToText(blob: ByteArray): String {
         val plaintext = decrypt(blob)
+        return try {
+            String(plaintext, Charsets.UTF_8)
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    fun decryptToText(blob: ByteArray, aad: ByteArray): String {
+        val plaintext = decrypt(blob, aad)
         return try {
             String(plaintext, Charsets.UTF_8)
         } finally {
@@ -216,6 +273,14 @@ class Crypto private constructor(rawKey: ByteArray) {
             }
             instances.forEach { it.destroy() }
         }
+        private val RECORD_MAGIC = byteArrayOf(0x53, 0x4E, 0x45, 0x32) // SNE2
+        /** Domain-separated AAD for one logical object in one vault namespace. */
+        fun contextAad(domain: String, objectId: String): ByteArray {
+            require(domain.isNotBlank() && domain.length <= 64)
+            require(objectId.isNotBlank() && objectId.length <= 256)
+            return ("SecNote/AAD/v2\u0000" + domain + "\u0000" + objectId).toByteArray(Charsets.UTF_8)
+        }
+
         private const val ITERATIONS = 250_000
         private const val KEY_BITS = 256
         private const val SALT_LEN = 16

@@ -159,7 +159,7 @@ class FileVaultRepository(
                     val expectedDigest = sourceDigest.digest()
                     try {
                         verifyEncryptedFile(dataTemp, plaintextSize, expectedDigest)
-                        val encryptedMetadata = crypto.encrypt(metadataJson(item))
+                        val encryptedMetadata = crypto.encrypt(metadataJson(item), Crypto.contextAad("file-metadata", item.id))
                         try {
                             FileOutputStream(metaTemp, false).use { metadataOutput ->
                                 metadataOutput.write(encryptedMetadata)
@@ -260,7 +260,7 @@ class FileVaultRepository(
                     dateTakenAt = originalPhotoDate,
                     photoDateResolved = isPhoto
                 )
-                val encryptedMetadata = crypto.encrypt(metadataJson(item))
+                val encryptedMetadata = crypto.encrypt(metadataJson(item), Crypto.contextAad("file-metadata", item.id))
                 try {
                     FileOutputStream(metaTemp, false).use { metadataOutput ->
                         metadataOutput.write(encryptedMetadata)
@@ -498,7 +498,7 @@ class FileVaultRepository(
     private fun verifyEncryptedMetadata(file: File, expected: VaultFile) {
         val ciphertext = file.readBytes()
         try {
-            val decoded = crypto.decryptToText(ciphertext)
+            val decoded = crypto.decryptToText(ciphertext, Crypto.contextAad("file-metadata", expected.id))
             check(decoded == metadataJson(expected)) { "Проверка зашифрованных метаданных не пройдена." }
         } finally {
             ciphertext.fill(0)
@@ -549,7 +549,17 @@ class FileVaultRepository(
 
     private fun readMetadata(id: String): VaultFile {
         val metadata = metadataFile(id)
-        val json = JSONObject(crypto.decryptToText(AtomicFileIO.readBytes(metadata)))
+        val encrypted = AtomicFileIO.readBytes(metadata)
+        val legacy = !crypto.isContextualRecord(encrypted)
+        val jsonText = try {
+            crypto.decryptToText(encrypted, Crypto.contextAad("file-metadata", id))
+        } finally {
+            encrypted.fill(0)
+        }
+        val json = JSONObject(jsonText)
+        if (json.has("id")) {
+            require(json.getString("id") == id) { "Идентификатор файла не совпадает с именем записи." }
+        }
         val sizeBytes = json.optLong("sizeBytes", -1L)
         require(sizeBytes >= 0L) { "В метаданных указан недопустимый размер файла." }
         return VaultFile(
@@ -560,10 +570,13 @@ class FileVaultRepository(
             addedAt = json.optLong("addedAt", 0L),
             dateTakenAt = if (json.has("dateTakenAt") && !json.isNull("dateTakenAt")) json.optLong("dateTakenAt") else null,
             photoDateResolved = json.optBoolean("photoDateResolved", json.has("dateTakenAt"))
-        )
+        ).also { item ->
+            if (legacy) runCatching { writeMetadataAtomically(item) }
+        }
     }
 
     private fun metadataJson(item: VaultFile): String = JSONObject()
+        .put("id", item.id)
         .put("name", item.name)
         .put("mimeType", item.mimeType)
         .put("sizeBytes", item.sizeBytes)
@@ -643,7 +656,7 @@ class FileVaultRepository(
     }
 
     private fun writeMetadataAtomically(item: VaultFile) {
-        val encrypted = crypto.encrypt(metadataJson(item))
+        val encrypted = crypto.encrypt(metadataJson(item), Crypto.contextAad("file-metadata", item.id))
         try {
             AtomicFileIO.writeBytes(metadataFile(item.id), encrypted)
         } finally {

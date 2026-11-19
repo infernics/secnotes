@@ -60,7 +60,16 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
             .distinctBy { it.name }
         val notes = noteFiles.mapNotNull { file ->
                 runCatching {
-                    val json = JSONObject(crypto.decryptToText(AtomicFileIO.readBytes(file)))
+                    val expectedId = file.name.removeSuffix(".enc")
+                    val encrypted = AtomicFileIO.readBytes(file)
+                    val legacyRecord = !crypto.isContextualRecord(encrypted)
+                    val jsonText = try {
+                        crypto.decryptToText(encrypted, Crypto.contextAad("note-record", expectedId))
+                    } finally {
+                        encrypted.fill(0)
+                    }
+                    val json = JSONObject(jsonText)
+                    require(json.getString("id") == expectedId) { "Идентификатор заметки не совпадает с именем файла." }
                     val checklistJson = json.optJSONArray("checklist") ?: JSONArray()
                     val checklist = buildList {
                         for (index in 0 until checklistJson.length()) {
@@ -82,14 +91,17 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
                     }
                     val updatedAt = json.optLong("updatedAt", file.lastModified())
                     Note(
-                        id = json.getString("id"),
+                        id = expectedId,
                         title = json.optString("title", ""),
                         body = json.optString("body", ""),
                         checklist = checklist,
                         kind = kind,
                         updatedAt = updatedAt,
                         sortOrder = json.optLong("sortOrder", Long.MAX_VALUE)
-                    )
+                    ).also { note ->
+                        // Upgrade legacy records only after successful decryption and ID validation.
+                        if (legacyRecord) runCatching { writeNote(note, file) }
+                    }
                 }.getOrNull()
             }
         if (notes.any { it.sortOrder != Long.MAX_VALUE }) {
@@ -147,7 +159,7 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
             .put("kind", note.kind.name)
             .put("updatedAt", note.updatedAt)
             .put("sortOrder", note.sortOrder)
-        val encrypted = crypto.encrypt(json.toString())
+        val encrypted = crypto.encrypt(json.toString(), Crypto.contextAad("note-record", note.id))
         try {
             AtomicFileIO.writeBytes(target, encrypted)
         } finally {
@@ -156,7 +168,16 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
     }
 
     private fun readStoredSortOrder(file: File): Long? = runCatching {
-        JSONObject(crypto.decryptToText(AtomicFileIO.readBytes(file))).optLong("sortOrder", Long.MAX_VALUE)
+        val expectedId = file.name.removeSuffix(".enc")
+        val encrypted = AtomicFileIO.readBytes(file)
+        val jsonText = try {
+            crypto.decryptToText(encrypted, Crypto.contextAad("note-record", expectedId))
+        } finally {
+            encrypted.fill(0)
+        }
+        val json = JSONObject(jsonText)
+        require(json.getString("id") == expectedId) { "Идентификатор заметки не совпадает с именем файла." }
+        json.optLong("sortOrder", Long.MAX_VALUE)
     }.getOrNull()
 
     private fun overwriteAndDelete(file: File) {

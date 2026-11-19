@@ -641,7 +641,10 @@ internal object BackupManager {
             notesDirectory.listFiles().orEmpty().filter { it.isFile && it.name.endsWith(".enc") }.forEach { file ->
                 require(file.length() in 1L..MAX_NOTE_BYTES) { "Некорректный размер заметки в резервной копии." }
                 val encryptedNote = file.readBytes()
-                val noteJson = try { crypto.decryptToText(encryptedNote) } finally { encryptedNote.fill(0) }
+                val noteId = file.name.removeSuffix(".enc")
+                val noteJson = try {
+                    crypto.decryptToText(encryptedNote, Crypto.contextAad("note-record", noteId))
+                } finally { encryptedNote.fill(0) }
                 val json = JSONObject(noteJson)
                 require(json.optString("id") == file.name.removeSuffix(".enc")) {
                     "Заметка не соответствует имени зашифрованной записи."
@@ -652,8 +655,13 @@ internal object BackupManager {
                 .map { it.name.removeSuffix(".meta.enc") }
             fileIds.forEach { id ->
                 val encryptedMetadataBytes = File(payload, "file_vault/$id.meta.enc").readBytes()
-                val metadataBytes = try { crypto.decrypt(encryptedMetadataBytes) } finally { encryptedMetadataBytes.fill(0) }
+                val metadataBytes = try {
+                    crypto.decrypt(encryptedMetadataBytes, Crypto.contextAad("file-metadata", id))
+                } finally { encryptedMetadataBytes.fill(0) }
                 val meta = try { JSONObject(String(metadataBytes, Charsets.UTF_8)) } finally { metadataBytes.fill(0) }
+                if (meta.has("id")) require(meta.getString("id") == id) {
+                    "Идентификатор метаданных не соответствует файлу $id."
+                }
                 require(meta.optString("name").isNotBlank() && meta.optLong("sizeBytes", -1L) >= 0L) {
                     "Повреждены метаданные файла $id."
                 }
