@@ -16,6 +16,7 @@ import java.io.OutputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.security.MessageDigest
+import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
@@ -272,11 +273,13 @@ internal object BackupManager {
                 progress("Восстанавливаю настройки…")
                 AppPreferences.applyBackupSettings(context, settings)
                 BiometricVault.disable(context) // Android Keystore biometric wrappers cannot move between devices.
-                StorageGate.resumeAfterUnlock()
                 progress("Завершаю восстановление…")
                 val marker = File(context.noBackupFilesDir, RESTORE_MARKER)
-                check(!marker.exists() || marker.delete()) { "Не удалось завершить транзакцию восстановления." }
+                deleteAtomicStateFile(marker)
+                // The new data/key state is committed once the marker is gone. Do not
+                // attempt to roll back to the old in-memory key after this point.
                 gateBlocked = false
+                StorageGate.resumeAfterUnlock()
                 deleteTreeBestEffort(transaction)
                 progress("Готово")
                 return BackupRestoreResult(
@@ -314,13 +317,16 @@ internal object BackupManager {
     /** Roll back an interrupted import before the app exposes its unlock screen. */
     fun recoverInterruptedRestore(context: Context): Boolean {
         val marker = File(context.noBackupFilesDir, RESTORE_MARKER)
-        if (!marker.isFile) {
+        if (!AtomicFileIO.existsRecoverable(marker)) {
             context.noBackupFilesDir.listFiles { file -> file.isDirectory && file.name.startsWith("secnote_restore_") }
                 ?.forEach(::deleteTreeBestEffort)
-            File(context.noBackupFilesDir, "$RESTORE_MARKER.tmp").delete()
+            deleteTreeBestEffort(File(context.noBackupFilesDir, "$RESTORE_MARKER.tmp"))
+            deleteTreeBestEffort(File(context.noBackupFilesDir, "$RESTORE_MARKER.bak"))
             return true
         }
-        val transactionName = runCatching { marker.readText(Charsets.US_ASCII).trim() }.getOrNull() ?: return false
+        val transactionName = runCatching {
+            String(AtomicFileIO.readBytes(marker), Charsets.US_ASCII).trim()
+        }.getOrNull() ?: return false
         if (!transactionName.matches(Regex("secnote_restore_[A-Fa-f0-9-]{36}"))) return false
         val transaction = File(context.noBackupFilesDir, transactionName)
         val rollback = File(transaction, "rollback")
@@ -330,20 +336,47 @@ internal object BackupManager {
             val index = JSONObject(indexFile.readText(Charsets.UTF_8))
             val existing = index.optJSONArray("existing") ?: JSONArray()
             val existingNames = buildSet {
-                for (i in 0 until existing.length()) add(existing.getString(i))
+                for (i in 0 until existing.length()) {
+                    val name = existing.getString(i)
+                    require(name in TARGET_NAMES) { "В журнале отката найден неизвестный объект." }
+                    require(add(name)) { "В журнале отката повторяется объект." }
+                }
             }
-            TARGET_NAMES.forEach { name ->
-                val target = File(context.filesDir, name)
-                deleteTreeBestEffort(target)
-                if (name in existingNames) {
-                    val snapshot = File(rollback, name)
-                    check(snapshot.exists()) { "Не найдена резервная копия старого состояния: $name" }
-                    copyTree(snapshot, target)
+            val snapshotHashes = index.optJSONObject("snapshotSha256")
+            // Validate every required snapshot before deleting or replacing any live data.
+            existingNames.forEach { name ->
+                val snapshot = File(rollback, name)
+                check(snapshot.exists()) { "Не найдена резервная копия старого состояния: $name" }
+                val expectedHash = snapshotHashes?.optString(name)?.takeIf { it.isNotBlank() }
+                if (expectedHash != null) {
+                    check(treeSha256(snapshot) == expectedHash) {
+                        "Контрольная сумма копии для отката не совпадает: $name"
+                    }
                 }
             }
             val prefs = index.optJSONObject("preferences") ?: JSONObject()
-            AppPreferences.applyBackupSettings(context, parseSettings(prefs))
-            check(!marker.exists() || marker.delete()) { "Не удалось снять маркер отката восстановления." }
+            val restoredSettings = parseSettings(prefs)
+
+            TARGET_NAMES.forEach { name ->
+                val target = File(context.filesDir, name)
+                deleteAtomicStateFile(target)
+                if (name in existingNames) {
+                    val snapshot = File(rollback, name)
+                    copyTree(snapshot, target)
+                    val expectedHash = snapshotHashes?.optString(name)?.takeIf { it.isNotBlank() }
+                    if (expectedHash != null) {
+                        check(treeSha256(target) == expectedHash) {
+                            "Не удалось подтвердить восстановление прежнего объекта: $name"
+                        }
+                    } else {
+                        check(treeSha256(snapshot) == treeSha256(target)) {
+                            "Копия прежнего объекта не совпадает после восстановления: $name"
+                        }
+                    }
+                }
+            }
+            AppPreferences.applyBackupSettings(context, restoredSettings)
+            deleteAtomicStateFile(marker)
             deleteTreeBestEffort(transaction)
             true
         }.getOrDefault(false)
@@ -357,15 +390,24 @@ internal object BackupManager {
             entries += SourceEntry(path, file)
         }
 
-        File(context.filesDir, "notes").listFiles().orEmpty()
+        val notesDirectory = File(context.filesDir, "notes")
+        val fileVaultDirectory = File(context.filesDir, "file_vault")
+        recoverAtomicFiles(notesDirectory) { it.endsWith(".enc") }
+        recoverAtomicFiles(fileVaultDirectory) { it.endsWith(".meta.enc") }
+        notesDirectory.listFiles().orEmpty()
             .filter { it.isFile && it.name.endsWith(".enc") }
             .forEach { add("notes/${it.name}", it) }
-        File(context.filesDir, "file_vault").listFiles().orEmpty()
+        fileVaultDirectory.listFiles().orEmpty()
             .filter { it.isFile && (it.name.endsWith(".data.enc") || it.name.endsWith(".meta.enc")) }
             .forEach { add("file_vault/${it.name}", it) }
 
         val hiddenMetadata = File(context.filesDir, HiddenVault.METADATA_FILE_NAME)
         val hiddenDirectory = File(context.filesDir, HiddenVault.DIRECTORY_NAME)
+        recoverAtomicFiles(hiddenDirectory) { it.endsWith(".meta.enc") }
+        if (AtomicFileIO.existsRecoverable(hiddenMetadata)) {
+            // Resolve AtomicFile's recovery backup before archiving the hidden-vault key record.
+            AtomicFileIO.readBytes(hiddenMetadata).fill(0)
+        }
         if (hiddenMetadata.isFile) {
             add("hidden/${HiddenVault.METADATA_FILE_NAME}", hiddenMetadata)
             hiddenDirectory.listFiles().orEmpty()
@@ -378,9 +420,11 @@ internal object BackupManager {
         }
 
         val mainCheck = File(context.filesDir, "key.check")
+        if (AtomicFileIO.existsRecoverable(mainCheck)) AtomicFileIO.readBytes(mainCheck).fill(0)
         check(mainCheck.isFile) { "Не найдена проверка основного ключа." }
         add("security/main-check.enc", mainCheck)
         val panic = File(context.filesDir, "panic.credential")
+        if (AtomicFileIO.existsRecoverable(panic)) AtomicFileIO.readBytes(panic).fill(0)
         if (panic.isFile) add("security/panic.credential", panic)
 
         val paths = entries.map { it.archivePath }.toSet()
@@ -626,57 +670,108 @@ internal object BackupManager {
         }
     }
 
+    /**
+     * Resolve AtomicFile recovery backups before enumerating a backup archive. Without
+     * this, a .bak-only note/metadata record could be omitted even though it is recoverable.
+     */
+    private fun recoverAtomicFiles(directory: File, acceptsBaseName: (String) -> Boolean) {
+        if (!directory.exists()) return
+        val children = directory.listFiles()
+            ?: error("Не удалось прочитать каталог перед созданием резервной копии: ${directory.name}")
+        val bases = children.mapNotNull { child ->
+            val baseName = if (child.name.endsWith(".bak")) child.name.removeSuffix(".bak") else child.name
+            if (acceptsBaseName(baseName)) File(directory, baseName) else null
+        }.distinctBy { it.name }
+        bases.forEach { base ->
+            if (AtomicFileIO.existsRecoverable(base)) {
+                AtomicFileIO.readBytes(base).fill(0)
+            }
+        }
+    }
+
     private fun snapshotCurrentState(context: Context, rollback: File) {
         check(rollback.mkdirs()) { "Не удалось подготовить откат восстановления." }
         val existing = JSONArray()
+        val snapshotHashes = JSONObject()
+        val atomicFileNames = setOf(
+            HiddenVault.METADATA_FILE_NAME, "key.salt", "key.check", "panic.credential"
+        )
         TARGET_NAMES.forEach { name ->
             val source = File(context.filesDir, name)
-            if (source.exists()) {
+            val exists = if (name in atomicFileNames) AtomicFileIO.existsRecoverable(source) else source.exists()
+            if (exists) {
+                val snapshot = File(rollback, name)
                 existing.put(name)
-                copyTree(source, File(rollback, name))
+                if (name in atomicFileNames) {
+                    val authoritativeBytes = AtomicFileIO.readBytes(source)
+                    val authoritativeHash = MessageDigest.getInstance("SHA-256").digest(authoritativeBytes)
+                    try {
+                        AtomicFileIO.writeBytes(snapshot, authoritativeBytes)
+                        val copiedBytes = AtomicFileIO.readBytes(snapshot)
+                        val copiedHash = MessageDigest.getInstance("SHA-256").digest(copiedBytes)
+                        try {
+                            check(MessageDigest.isEqual(authoritativeHash, copiedHash)) {
+                                "Не удалось проверить резервную копию текущего объекта: $name"
+                            }
+                        } finally {
+                            copiedBytes.fill(0)
+                            copiedHash.fill(0)
+                        }
+                    } finally {
+                        authoritativeBytes.fill(0)
+                        authoritativeHash.fill(0)
+                    }
+                } else {
+                    val sourceHash = treeSha256(source)
+                    copyTree(source, snapshot)
+                    check(treeSha256(snapshot) == sourceHash) {
+                        "Не удалось проверить резервную копию текущего объекта: $name"
+                    }
+                }
+                snapshotHashes.put(name, treeSha256(snapshot))
             }
         }
         val oldSettings = AppPreferences.backupSettings(context)
         val index = JSONObject()
             .put("existing", existing)
+            .put("snapshotSha256", snapshotHashes)
             .put("preferences", settingsToJson(oldSettings))
-        val indexFile = File(rollback, "rollback-index.json")
-        FileOutputStream(indexFile, false).use { output ->
-            output.write(index.toString().toByteArray(Charsets.UTF_8))
-            output.fd.sync()
-        }
+        AtomicFileIO.writeBytes(
+            File(rollback, "rollback-index.json"),
+            index.toString().toByteArray(Charsets.UTF_8)
+        )
     }
 
     private fun writeRestoreMarker(context: Context, transactionName: String) {
         val marker = File(context.noBackupFilesDir, RESTORE_MARKER)
-        val temp = File(context.noBackupFilesDir, "$RESTORE_MARKER.tmp")
-        FileOutputStream(temp, false).use { output ->
-            output.write(transactionName.toByteArray(Charsets.US_ASCII))
-            output.fd.sync()
-        }
-        check(temp.renameTo(marker)) { "Не удалось зафиксировать транзакцию восстановления." }
+        AtomicFileIO.writeBytes(marker, transactionName.toByteArray(Charsets.US_ASCII))
     }
 
     private fun replaceFromPayload(context: Context, payload: File) {
-        listOf("notes", "file_vault", HiddenVault.DIRECTORY_NAME).forEach { name ->
-            val target = File(context.filesDir, name)
-            deleteTreeBestEffort(target)
-            val source = when (name) {
-                "notes" -> File(payload, "notes")
-                "file_vault" -> File(payload, "file_vault")
-                else -> File(payload, "hidden/${HiddenVault.DIRECTORY_NAME}")
+        fun replace(target: File, source: File) {
+            deleteAtomicStateFile(target)
+            if (source.exists()) {
+                copyTree(source, target)
+                check(treeSha256(source) == treeSha256(target)) {
+                    "Не удалось проверить восстановленный объект: ${target.name}"
+                }
             }
-            if (source.exists()) copyTree(source, target)
         }
-        val metadataSource = File(payload, "hidden/${HiddenVault.METADATA_FILE_NAME}")
-        val metadataTarget = File(context.filesDir, HiddenVault.METADATA_FILE_NAME)
-        deleteTreeBestEffort(metadataTarget)
-        if (metadataSource.isFile) copyTree(metadataSource, metadataTarget)
 
-        val panicSource = File(payload, "security/panic.credential")
-        val panicTarget = File(context.filesDir, "panic.credential")
-        deleteTreeBestEffort(panicTarget)
-        if (panicSource.isFile) copyTree(panicSource, panicTarget)
+        replace(File(context.filesDir, "notes"), File(payload, "notes"))
+        replace(File(context.filesDir, "file_vault"), File(payload, "file_vault"))
+        replace(
+            File(context.filesDir, HiddenVault.DIRECTORY_NAME),
+            File(payload, "hidden/${HiddenVault.DIRECTORY_NAME}")
+        )
+        replace(
+            File(context.filesDir, HiddenVault.METADATA_FILE_NAME),
+            File(payload, "hidden/${HiddenVault.METADATA_FILE_NAME}")
+        )
+        replace(
+            File(context.filesDir, "panic.credential"),
+            File(payload, "security/panic.credential")
+        )
     }
 
     private fun safeStageFile(root: File, relativePath: String): File {
@@ -745,23 +840,98 @@ internal object BackupManager {
     }
 
     private fun copyTree(source: File, destination: File) {
+        check(source.exists()) { "Источник для копирования не существует: ${source.name}" }
         if (source.isDirectory) {
-            check(destination.isDirectory || destination.mkdirs()) { "Не удалось создать каталог восстановления." }
-            source.listFiles().orEmpty().forEach { child -> copyTree(child, File(destination, child.name)) }
+            check(!destination.exists() || destination.isDirectory) {
+                "Назначение каталога восстановления занято файлом: ${destination.name}"
+            }
+            check(destination.isDirectory || destination.mkdirs()) {
+                "Не удалось создать каталог восстановления: ${destination.name}"
+            }
+            val children = source.listFiles()
+                ?: error("Не удалось прочитать содержимое каталога: ${source.name}")
+            children.sortedBy { it.name }.forEach { child ->
+                copyTree(child, File(destination, child.name))
+            }
         } else {
-            destination.parentFile?.let { check(it.isDirectory || it.mkdirs()) }
+            check(source.isFile) { "Недопустимый объект в области восстановления: ${source.name}" }
+            destination.parentFile?.let { parent ->
+                check(parent.isDirectory || parent.mkdirs()) { "Не удалось создать каталог восстановления." }
+            }
             FileInputStream(source).use { input ->
                 FileOutputStream(destination, false).use { output ->
                     input.copyTo(output, 64 * 1024)
                     output.fd.sync()
                 }
             }
+            check(destination.isFile && destination.length() == source.length()) {
+                "Скопированный файл имеет неправильный размер: ${source.name}"
+            }
+        }
+    }
+
+    /** Strict deletion for live data during restore/rollback. Failure must stop the transaction. */
+    private fun deleteTreeStrict(entry: File) {
+        if (!entry.exists()) return
+        if (entry.isDirectory) {
+            val children = entry.listFiles()
+                ?: error("Не удалось прочитать каталог перед удалением: ${entry.name}")
+            children.forEach(::deleteTreeStrict)
+        }
+        check(entry.delete() || !entry.exists()) {
+            "Не удалось удалить объект перед восстановлением: ${entry.name}"
+        }
+        check(!entry.exists()) { "Объект остался после удаления: ${entry.name}" }
+    }
+
+    private fun deleteAtomicStateFile(file: File) {
+        deleteTreeStrict(file)
+        deleteTreeStrict(File(file.path + ".bak"))
+        deleteTreeStrict(File(file.path + ".new"))
+    }
+
+    /** Stable SHA-256 over a file/tree including relative names, types and file contents. */
+    private fun treeSha256(root: File): String {
+        require(root.exists()) { "Объект для проверки не существует: ${root.name}" }
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+
+        fun visit(file: File, relativePath: String) {
+            val pathBytes = relativePath.toByteArray(Charsets.UTF_8)
+            digest.update(ByteBuffer.allocate(4).putInt(pathBytes.size).array())
+            digest.update(pathBytes)
+            if (file.isDirectory) {
+                digest.update(0x44.toByte())
+                val children = file.listFiles()
+                    ?: error("Не удалось прочитать каталог для проверки: ${file.name}")
+                children.sortedBy { it.name }.forEach { child ->
+                    visit(child, if (relativePath.isEmpty()) child.name else "$relativePath/${child.name}")
+                }
+            } else {
+                check(file.isFile) { "Неизвестный тип объекта: ${file.name}" }
+                digest.update(0x46.toByte())
+                digest.update(ByteBuffer.allocate(8).putLong(file.length()).array())
+                FileInputStream(file).use { input ->
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        digest.update(buffer, 0, count)
+                    }
+                }
+            }
+        }
+
+        try {
+            visit(root, "")
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        } finally {
+            buffer.fill(0)
         }
     }
 
     private fun deleteTreeBestEffort(entry: File) {
         if (!entry.exists()) return
-        if (entry.isDirectory) entry.listFiles().orEmpty().forEach(::deleteTreeBestEffort)
+        if (entry.isDirectory) entry.listFiles()?.forEach(::deleteTreeBestEffort)
         entry.delete()
     }
 

@@ -4,7 +4,6 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.util.UUID
 
@@ -49,11 +48,19 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
 
     @Synchronized
     fun loadAll(): List<Note> = StorageGate.withAccess(generation) {
-        val notes = dir.listFiles { file -> file.name.endsWith(".enc") }
+        val noteFiles = dir.listFiles()
             .orEmpty()
             .mapNotNull { file ->
+                when {
+                    file.name.endsWith(".enc") -> file
+                    file.name.endsWith(".enc.bak") -> File(dir, file.name.removeSuffix(".bak"))
+                    else -> null
+                }
+            }
+            .distinctBy { it.name }
+        val notes = noteFiles.mapNotNull { file ->
                 runCatching {
-                    val json = JSONObject(crypto.decryptToText(file.readBytes()))
+                    val json = JSONObject(crypto.decryptToText(AtomicFileIO.readBytes(file)))
                     val checklistJson = json.optJSONArray("checklist") ?: JSONArray()
                     val checklist = buildList {
                         for (index in 0 until checklistJson.length()) {
@@ -140,26 +147,20 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
             .put("kind", note.kind.name)
             .put("updatedAt", note.updatedAt)
             .put("sortOrder", note.sortOrder)
-        val temp = File(dir, "${note.id}.tmp")
-        FileOutputStream(temp, false).use { stream ->
-            stream.write(crypto.encrypt(json.toString()))
-            stream.fd.sync()
-        }
-        if (!temp.renameTo(target)) {
-            FileOutputStream(target, false).use { stream ->
-                temp.inputStream().use { it.copyTo(stream) }
-                stream.fd.sync()
-            }
-            temp.delete()
+        val encrypted = crypto.encrypt(json.toString())
+        try {
+            AtomicFileIO.writeBytes(target, encrypted)
+        } finally {
+            encrypted.fill(0)
         }
     }
 
     private fun readStoredSortOrder(file: File): Long? = runCatching {
-        JSONObject(crypto.decryptToText(file.readBytes())).optLong("sortOrder", Long.MAX_VALUE)
+        JSONObject(crypto.decryptToText(AtomicFileIO.readBytes(file))).optLong("sortOrder", Long.MAX_VALUE)
     }.getOrNull()
 
     private fun overwriteAndDelete(file: File) {
-        if (!file.exists()) return
+        if (!AtomicFileIO.existsRecoverable(file)) return
         runCatching {
             val originalLength = file.length()
             RandomAccessFile(file, "rw").use { stream ->
@@ -175,6 +176,6 @@ class NoteRepository(context: Context, private val crypto: Crypto) {
                 stream.fd.sync()
             }
         }
-        file.delete()
+        check(AtomicFileIO.delete(file)) { "Не удалось удалить заметку из хранилища." }
     }
 }

@@ -4,7 +4,6 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.io.File
-import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -34,7 +33,8 @@ object Vault {
     private fun saltFile(context: Context) = File(context.filesDir, "key.salt")
     private fun checkFile(context: Context) = File(context.filesDir, "key.check")
 
-    fun isSetup(context: Context): Boolean = saltFile(context).exists() && checkFile(context).exists()
+    fun isSetup(context: Context): Boolean =
+        AtomicFileIO.existsRecoverable(saltFile(context)) && AtomicFileIO.existsRecoverable(checkFile(context))
 
     @Synchronized
     fun create(context: Context, passphrase: String): Crypto {
@@ -75,7 +75,7 @@ object Vault {
         var storedSalt: ByteArray? = null
         var salt: ByteArray? = null
         return try {
-            val storedBytes = saltFile(context).readBytes()
+            val storedBytes = AtomicFileIO.readBytes(saltFile(context))
             storedSalt = storedBytes
             val recoveredSalt = if (storedBytes.size == SALT_LENGTH) {
                 storedBytes.copyOf() // 1.3.2/1.3.3 legacy raw PBKDF2 salt
@@ -114,16 +114,16 @@ object Vault {
         return try {
             val salt = saltFile(context)
             val check = checkFile(context)
-            if (!salt.isFile || !check.isFile) return false
+            if (!AtomicFileIO.existsRecoverable(salt) || !AtomicFileIO.existsRecoverable(check)) return false
 
-            val storedBytes = salt.readBytes()
+            val storedBytes = AtomicFileIO.readBytes(salt)
             storedSalt = storedBytes
             val isLegacySalt = storedBytes.size == SALT_LENGTH
             val saltBytes = if (isLegacySalt) storedBytes.copyOf() else unwrapSalt(storedBytes)
             recoveredSalt = saltBytes
             if (saltBytes.size != SALT_LENGTH) return false
 
-            val checkBytes = check.readBytes()
+            val checkBytes = AtomicFileIO.readBytes(check)
             checkBlob = checkBytes
             if (crypto.decryptToText(checkBytes) != "verify") return false
 
@@ -151,11 +151,11 @@ object Vault {
         var candidate: Crypto? = null
         return try {
             if (!isSetup(context)) return false
-            val storedBytes = saltFile(context).readBytes()
+            val storedBytes = AtomicFileIO.readBytes(saltFile(context))
             stored = storedBytes
             val rawSalt = if (storedBytes.size == SALT_LENGTH) storedBytes.copyOf() else unwrapSalt(storedBytes)
             salt = rawSalt
-            checkBlob = checkFile(context).readBytes()
+            checkBlob = AtomicFileIO.readBytes(checkFile(context))
             val crypto = Crypto.fromPassphrase(passphrase, rawSalt)
             candidate = crypto
             crypto.decryptToText(checkBlob) == "verify"
@@ -176,13 +176,13 @@ object Vault {
         var salt: ByteArray? = null
         var checkBlob: ByteArray? = null
         return try {
-            check(File(context.filesDir, "key.check").isFile) { "Основное хранилище не настроено." }
-            val storedBytes = saltFile(context).readBytes()
+            check(AtomicFileIO.existsRecoverable(File(context.filesDir, "key.check"))) { "Основное хранилище не настроено." }
+            val storedBytes = AtomicFileIO.readBytes(saltFile(context))
             stored = storedBytes
             val rawSalt = if (storedBytes.size == SALT_LENGTH) storedBytes.copyOf() else unwrapSalt(storedBytes)
             salt = rawSalt
             check(rawSalt.size == SALT_LENGTH) { "Некорректная соль основного хранилища." }
-            val checkBytes = checkFile(context).readBytes()
+            val checkBytes = AtomicFileIO.readBytes(checkFile(context))
             checkBlob = checkBytes
             require(crypto.decryptToText(checkBytes) == "verify") { "Ключ текущего хранилища не подтверждён." }
             rawSalt.copyOf()
@@ -269,17 +269,6 @@ object Vault {
     }
 
     private fun writeAtomically(destination: File, bytes: ByteArray) {
-        val temp = File(destination.parentFile, destination.name + ".tmp")
-        FileOutputStream(temp, false).use { stream ->
-            stream.write(bytes)
-            stream.fd.sync()
-        }
-        if (!temp.renameTo(destination)) {
-            FileOutputStream(destination, false).use { stream ->
-                stream.write(bytes)
-                stream.fd.sync()
-            }
-            temp.delete()
-        }
+        AtomicFileIO.writeBytes(destination, bytes)
     }
 }

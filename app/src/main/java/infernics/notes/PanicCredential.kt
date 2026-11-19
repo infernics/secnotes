@@ -2,7 +2,6 @@ package infernics.notes
 
 import android.content.Context
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.security.MessageDigest
@@ -24,7 +23,7 @@ object PanicCredential {
     private const val RECORD_LENGTH = 4 + SALT_LENGTH + VERIFIER_LENGTH
     private const val KEY_BITS = VERIFIER_LENGTH * 8
 
-    fun isConfigured(context: Context): Boolean = credentialFile(context).isFile
+    fun isConfigured(context: Context): Boolean = AtomicFileIO.existsRecoverable(credentialFile(context))
 
     @Synchronized
     fun set(context: Context, password: String) {
@@ -45,8 +44,8 @@ object PanicCredential {
     fun verify(context: Context, password: String): Boolean {
         if (password.isEmpty()) return false
         val file = credentialFile(context)
-        if (!file.isFile) return false
-        val record = runCatching { file.readBytes() }.getOrNull() ?: return false
+        if (!AtomicFileIO.existsRecoverable(file)) return false
+        val record = runCatching { AtomicFileIO.readBytes(file) }.getOrNull() ?: return false
         return try {
             verifyRecord(password, record)
         } finally {
@@ -58,8 +57,12 @@ object PanicCredential {
     fun remove(context: Context) {
         val file = credentialFile(context)
         bestEffortOverwrite(file)
-        file.delete()
-        File(file.parentFile, "$FILE_NAME.tmp").delete()
+        check(AtomicFileIO.delete(file)) { "Не удалось удалить секретный пароль уничтожения." }
+        val legacyTemporary = File(file.parentFile, "$FILE_NAME.tmp")
+        bestEffortOverwrite(legacyTemporary)
+        check(!legacyTemporary.exists() || legacyTemporary.delete()) {
+            "Не удалось удалить временный файл секретного пароля уничтожения."
+        }
     }
 
 
@@ -119,18 +122,7 @@ object PanicCredential {
     private fun credentialFile(context: Context) = File(context.filesDir, FILE_NAME)
 
     private fun writeAtomically(destination: File, bytes: ByteArray) {
-        val temporary = File(destination.parentFile, "$FILE_NAME.tmp")
-        FileOutputStream(temporary, false).use { stream ->
-            stream.write(bytes)
-            stream.fd.sync()
-        }
-        if (!temporary.renameTo(destination)) {
-            FileOutputStream(destination, false).use { stream ->
-                stream.write(bytes)
-                stream.fd.sync()
-            }
-            temporary.delete()
-        }
+        AtomicFileIO.writeBytes(destination, bytes)
     }
 
     private fun bestEffortOverwrite(file: File) {

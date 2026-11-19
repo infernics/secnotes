@@ -2,7 +2,6 @@ package infernics.notes
 
 import android.content.Context
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.security.KeyStore
 import java.security.SecureRandom
@@ -24,16 +23,13 @@ object EmergencyWipe {
     private const val SHARED_PREFS = "shared_prefs"
     private const val KEYSTORE_ALIAS_PREFIX = "SecNote"
 
-    fun isPending(context: Context): Boolean = markerFile(context).isFile
+    fun isPending(context: Context): Boolean = AtomicFileIO.existsRecoverable(markerFile(context))
 
     @Synchronized
     fun markPending(context: Context) {
         val marker = markerFile(context)
         marker.parentFile?.mkdirs()
-        FileOutputStream(marker, false).use { stream ->
-            stream.write("SECNOTE-WIPE-V1".toByteArray(Charsets.US_ASCII))
-            stream.fd.sync()
-        }
+        AtomicFileIO.writeBytes(marker, "SECNOTE-WIPE-V1".toByteArray(Charsets.US_ASCII))
     }
 
     /** Returns true only after all app-owned storage targets are cleared and marker removed. */
@@ -57,8 +53,9 @@ object EmergencyWipe {
             // Invalidate the current password-derived key material before wiping payloads.
             val criticalMaterialsClean = listOf(
                 "key.salt", "key.check", "panic.credential", "key.salt.tmp", "key.check.tmp",
-                HiddenVault.METADATA_FILE_NAME, "${HiddenVault.METADATA_FILE_NAME}.tmp"
-            ).all { name -> wipeEntry(File(context.filesDir, name)) }
+                "panic.credential.tmp", HiddenVault.METADATA_FILE_NAME,
+                "${HiddenVault.METADATA_FILE_NAME}.tmp"
+            ).all { name -> wipeAtomicEntry(File(context.filesDir, name)) }
             if (!criticalMaterialsClean) return false
 
             val targets = buildList {
@@ -82,7 +79,12 @@ object EmergencyWipe {
             // data, but preserve the marker itself so interrupted cleanup is resumable.
             val noBackup = context.noBackupFilesDir
             val marker = markerFile(context)
-            if (noBackup.exists() && !wipeDirectoryContents(noBackup, setOf(marker.canonicalPath))) {
+            val preservedMarkerFiles = setOf(
+                marker.canonicalPath,
+                File(marker.path + ".bak").canonicalPath,
+                File(marker.path + ".new").canonicalPath
+            )
+            if (noBackup.exists() && !wipeDirectoryContents(noBackup, preservedMarkerFiles)) {
                 return false
             }
 
@@ -95,7 +97,7 @@ object EmergencyWipe {
             if (File(context.filesDir, HiddenVault.DIRECTORY_NAME).exists()) return false
             if (File(context.filesDir, HiddenVault.METADATA_FILE_NAME).exists()) return false
 
-            marker.delete()
+            AtomicFileIO.delete(marker)
         } catch (_: Exception) {
             false
         }
@@ -110,6 +112,20 @@ object EmergencyWipe {
     }.getOrDefault(false)
 
     private fun markerFile(context: Context) = File(context.noBackupFilesDir, MARKER)
+
+    /** Wipe AtomicFile's base, recoverable backup and uncommitted write siblings. */
+    private fun wipeAtomicEntry(file: File): Boolean {
+        val siblings = listOf(
+            file,
+            File(file.path + ".bak"),
+            File(file.path + ".new")
+        )
+        var success = true
+        siblings.forEach { candidate ->
+            if (candidate.exists() && !wipeEntry(candidate)) success = false
+        }
+        return success && siblings.none { it.exists() }
+    }
 
     private fun wipeDirectoryContents(directory: File, preserved: Set<String> = emptySet()): Boolean {
         if (!directory.exists()) return true

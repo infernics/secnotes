@@ -14,6 +14,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import android.os.Bundle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -966,24 +967,35 @@ private fun NotesHomeScreen(
         NoteEditorScreen(
             note = current,
             isNew = editingIsNew,
-            onAutoSave = { changed -> NoteSaveQueue.save(repository, changed) },
-            onFinish = { finalNote ->
+            onAutoSave = { changed, complete -> NoteSaveQueue.save(repository, changed, complete) },
+            onFinish = { finalNote, complete ->
                 if (finalNote == null) {
                     editing = null
+                    complete(Result.success(Unit))
                 } else {
-                    NoteSaveQueue.save(repository, finalNote) {
-                        scope.launch {
-                            reload()
-                            editing = null
+                    NoteSaveQueue.save(repository, finalNote) { result ->
+                        if (result.isSuccess) {
+                            scope.launch {
+                                reload()
+                                complete(result)
+                                editing = null
+                            }
+                        } else {
+                            complete(result)
                         }
                     }
                 }
             },
-            onDeleted = { id ->
-                NoteSaveQueue.delete(repository, id) {
-                    scope.launch {
-                        reload()
-                        editing = null
+            onDeleted = { id, complete ->
+                NoteSaveQueue.delete(repository, id) { result ->
+                    if (result.isSuccess) {
+                        scope.launch {
+                            reload()
+                            complete(result)
+                            editing = null
+                        }
+                    } else {
+                        complete(result)
                     }
                 }
             },
@@ -1005,7 +1017,16 @@ private fun NotesHomeScreen(
                 val reordered = swapNotePositions(notes, fromId, toId)
                 if (reordered !== notes) {
                     notes = reordered
-                    NoteSaveQueue.reorder(repository, reordered)
+                    NoteSaveQueue.reorder(repository, reordered) { result ->
+                        if (result.isFailure) {
+                            scope.launch { reload() }
+                            Toast.makeText(
+                                context,
+                                "Не удалось сохранить новый порядок заметок.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
                 }
             },
             onOpenFiles = onOpenFiles,
@@ -1262,9 +1283,9 @@ private fun NotesListScreen(
 private fun NoteEditorScreen(
     note: Note,
     isNew: Boolean,
-    onAutoSave: (Note) -> Unit,
-    onFinish: (Note?) -> Unit,
-    onDeleted: (String) -> Unit,
+    onAutoSave: (Note, (Result<Unit>) -> Unit) -> Unit,
+    onFinish: (Note?, (Result<Unit>) -> Unit) -> Unit,
+    onDeleted: (String, (Result<Unit>) -> Unit) -> Unit,
     onDiscard: () -> Unit
 ) {
     var title by remember(note.id) { mutableStateOf(note.title) }
@@ -1286,8 +1307,16 @@ private fun NoteEditorScreen(
     var dirty by remember(note.id) { mutableStateOf(false) }
     var hasBeenEdited by remember(note.id) { mutableStateOf(false) }
     var saveStatus by remember(note.id) { mutableStateOf("Автосохранение включено") }
+    var editRevision by remember(note.id) { mutableStateOf(0) }
     val isList = note.kind == NoteKind.LIST
     val visibleTasks = checklist.filter { it.text.isNotBlank() }
+
+    fun markDirty() {
+        dirty = true
+        hasBeenEdited = true
+        editRevision++
+        saveStatus = "Есть несохранённые изменения"
+    }
 
     fun currentNote(): Note {
         val savedChecklist = if (isList) checklist.filter { it.text.isNotBlank() } else emptyList()
@@ -1304,9 +1333,7 @@ private fun NoteEditorScreen(
         val newItem = ChecklistItem()
         checklist = checklist + newItem
         focusNextId = newItem.id
-        dirty = true
-        hasBeenEdited = true
-        saveStatus = "Есть несохранённые изменения"
+        markDirty()
     }
 
     fun finishEditing() {
@@ -1315,22 +1342,36 @@ private fun NoteEditorScreen(
         if (isNew && current.title.isBlank() && !hasContent) {
             onDiscard()
         } else {
-            onFinish(current)
+            saveStatus = "Сохранение…"
+            onFinish(current) { result ->
+                if (result.isFailure) {
+                    saveStatus = "Не удалось сохранить. Изменения остались в редакторе; попробуйте ещё раз."
+                }
+            }
         }
     }
 
     // Debounced after each edit. The serial IO queue survives editor disposal and app locking.
-    LaunchedEffect(title, body, checklist, dirty) {
+    LaunchedEffect(title, body, checklist, dirty, editRevision) {
         if (!dirty) return@LaunchedEffect
         val candidate = currentNote()
         if (isNew && candidate.title.isBlank() && candidate.body.isBlank() && candidate.checklist.isEmpty()) {
             return@LaunchedEffect
         }
         saveStatus = "Сохранение…"
+        val revision = editRevision
         delay(400)
-        onAutoSave(candidate)
-        dirty = false
-        saveStatus = "Изменения сохраняются автоматически"
+        onAutoSave(candidate) { result ->
+            if (revision == editRevision) {
+                if (result.isSuccess) {
+                    dirty = false
+                    saveStatus = "Сохранено"
+                } else {
+                    dirty = true
+                    saveStatus = "Не удалось сохранить. Изменения остаются в редакторе; измените текст или выйдите и вернитесь, чтобы повторить попытку."
+                }
+            }
+        }
     }
 
     // Flush the latest editor state as soon as Android sends the app to the background.
@@ -1338,11 +1379,23 @@ private fun NoteEditorScreen(
     val latestCandidate by rememberUpdatedState(currentNote())
     val latestDirty by rememberUpdatedState(dirty)
     val latestHasBeenEdited by rememberUpdatedState(hasBeenEdited)
+    val latestRevision by rememberUpdatedState(editRevision)
     val latestAutoSave by rememberUpdatedState(onAutoSave)
     DisposableEffect(lifecycleOwner, note.id) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP && (latestDirty || latestHasBeenEdited)) {
-                latestAutoSave(latestCandidate)
+                val revision = latestRevision
+                latestAutoSave(latestCandidate) { result ->
+                    if (revision == latestRevision) {
+                        if (result.isSuccess) {
+                            dirty = false
+                            saveStatus = "Сохранено"
+                        } else {
+                            dirty = true
+                            saveStatus = "Не удалось сохранить изменения перед сворачиванием приложения."
+                        }
+                    }
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -1356,7 +1409,15 @@ private fun NoteEditorScreen(
             title = { Text(if (isList) "Удалить список?" else "Удалить заметку?") },
             text = { Text("Это действие нельзя отменить.") },
             confirmButton = {
-                TextButton(onClick = { askDelete = false; onDeleted(note.id) }) { Text("Удалить") }
+                TextButton(onClick = {
+                    askDelete = false
+                    saveStatus = "Удаление…"
+                    onDeleted(note.id) { result ->
+                        if (result.isFailure) {
+                            saveStatus = "Не удалось удалить запись. Она осталась в хранилище."
+                        }
+                    }
+                }) { Text("Удалить") }
             },
             dismissButton = {
                 TextButton(onClick = { askDelete = false }) { Text("Отмена") }
@@ -1398,7 +1459,7 @@ private fun NoteEditorScreen(
         ) {
             OutlinedTextField(
                 value = title,
-                onValueChange = { title = it; dirty = true; hasBeenEdited = true; saveStatus = "Сохранение…" },
+                onValueChange = { title = it; markDirty() },
                 label = { Text(if (isList) "Название списка" else "Заголовок") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
@@ -1408,7 +1469,7 @@ private fun NoteEditorScreen(
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = body,
-                    onValueChange = { body = it; dirty = true; hasBeenEdited = true; saveStatus = "Сохранение…" },
+                    onValueChange = { body = it; markDirty() },
                     label = { Text("Текст заметки") },
                     minLines = 7,
                     modifier = Modifier.fillMaxWidth()
@@ -1425,24 +1486,18 @@ private fun NoteEditorScreen(
                                 checklist = checklist.map { current ->
                                     if (current.id == item.id) current.copy(text = newText) else current
                                 }
-                                dirty = true
-                                hasBeenEdited = true
-                                saveStatus = "Сохранение…"
+                                markDirty()
                             },
                             onCheckedChange = { checked ->
                                 checklist = checklist.map { current ->
                                     if (current.id == item.id) current.copy(checked = checked) else current
                                 }
-                                dirty = true
-                                hasBeenEdited = true
-                                saveStatus = "Сохранение…"
+                                markDirty()
                             },
                             onNext = ::appendChecklistRow,
                             onDelete = {
                                 checklist = checklist.filterNot { it.id == item.id }
-                                dirty = true
-                                hasBeenEdited = true
-                                saveStatus = "Сохранение…"
+                                markDirty()
                             }
                         )
                     }
@@ -2021,11 +2076,17 @@ private fun SettingsScreen(
             text = { Text("Секретный пароль будет удалён. Основной пароль и данные останутся без изменений.") },
             confirmButton = {
                 TextButton(onClick = {
-                    PanicCredential.remove(context)
-                    panicConfigured = false
-                    onPanicPasswordConfiguredChange(false)
-                    showRemovePanicDialog = false
-                    message = "Секретный пароль уничтожения удалён."
+                    val removal = runCatching { PanicCredential.remove(context) }
+                    if (removal.isSuccess) {
+                        panicConfigured = false
+                        onPanicPasswordConfiguredChange(false)
+                        showRemovePanicDialog = false
+                        message = "Секретный пароль уничтожения удалён."
+                    } else {
+                        panicConfigured = PanicCredential.isConfigured(context)
+                        message = removal.exceptionOrNull()?.message
+                            ?: "Не удалось удалить секретный пароль уничтожения."
+                    }
                 }) { Text("Отключить") }
             },
             dismissButton = {

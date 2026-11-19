@@ -14,6 +14,10 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
+import java.security.DigestInputStream
+import java.security.DigestOutputStream
+import java.security.MessageDigest
 import java.io.InputStream
 import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
@@ -143,24 +147,37 @@ class FileVaultRepository(
                 val metaTarget = metadataFile(id)
 
                 try {
-                    ByteArrayInputStream(jpegBytes).use { source ->
+                    val sourceDigest = MessageDigest.getInstance("SHA-256")
+                    val plaintextSize = ByteArrayInputStream(jpegBytes).use { source ->
+                        val digestedSource = DigestInputStream(source, sourceDigest)
                         FileOutputStream(dataTemp, false).use { encryptedOutput ->
-                            crypto.encryptStream(source, encryptedOutput)
-                            encryptedOutput.fd.sync()
+                            crypto.encryptStream(digestedSource, encryptedOutput).also {
+                                encryptedOutput.fd.sync()
+                            }
                         }
                     }
-                    val encryptedMetadata = crypto.encrypt(metadataJson(item))
+                    val expectedDigest = sourceDigest.digest()
                     try {
-                        FileOutputStream(metaTemp, false).use { metadataOutput ->
-                            metadataOutput.write(encryptedMetadata)
-                            metadataOutput.fd.sync()
+                        verifyEncryptedFile(dataTemp, plaintextSize, expectedDigest)
+                        val encryptedMetadata = crypto.encrypt(metadataJson(item))
+                        try {
+                            FileOutputStream(metaTemp, false).use { metadataOutput ->
+                                metadataOutput.write(encryptedMetadata)
+                                metadataOutput.fd.sync()
+                            }
+                        } finally {
+                            encryptedMetadata.fill(0)
                         }
+                        verifyEncryptedMetadata(metaTemp, item)
+                        commitNewVaultPair(dataTemp, metaTemp, dataTarget, metaTarget)
+                        // Verify the committed names after rename/fsync, before the camera
+                        // buffer can be treated as safely stored.
+                        verifyEncryptedFile(dataTarget, plaintextSize, expectedDigest)
+                        verifyEncryptedMetadata(metaTarget, item)
+                        item
                     } finally {
-                        encryptedMetadata.fill(0)
+                        expectedDigest.fill(0)
                     }
-                    check(dataTemp.renameTo(dataTarget)) { "Не удалось сохранить зашифрованную фотографию" }
-                    check(metaTemp.renameTo(metaTarget)) { "Не удалось сохранить метаданные фотографии" }
-                    item
                 } catch (error: Exception) {
                     overwriteAndDelete(dataTemp)
                     overwriteAndDelete(metaTemp)
@@ -222,34 +239,46 @@ class FileVaultRepository(
         try {
             val input = context.contentResolver.openInputStream(uri)
                 ?: error("Не удалось открыть выбранный файл")
+            val sourceDigest = MessageDigest.getInstance("SHA-256")
             val size = input.use { source ->
+                val digestedSource = DigestInputStream(source, sourceDigest)
                 FileOutputStream(dataTemp, false).use { encryptedOutput ->
-                    val encryptedSize = crypto.encryptStream(source, encryptedOutput)
-                    encryptedOutput.fd.sync()
-                    encryptedSize
+                    crypto.encryptStream(digestedSource, encryptedOutput).also {
+                        encryptedOutput.fd.sync()
+                    }
                 }
             }
-            val item = VaultFile(
-                id = id,
-                name = name,
-                mimeType = mime,
-                sizeBytes = size,
-                addedAt = System.currentTimeMillis(),
-                dateTakenAt = originalPhotoDate,
-                photoDateResolved = isPhoto
-            )
-            val encryptedMetadata = crypto.encrypt(metadataJson(item))
+            val expectedDigest = sourceDigest.digest()
             try {
-                FileOutputStream(metaTemp, false).use { metadataOutput ->
-                    metadataOutput.write(encryptedMetadata)
-                    metadataOutput.fd.sync()
+                verifyEncryptedFile(dataTemp, size, expectedDigest)
+                val item = VaultFile(
+                    id = id,
+                    name = name,
+                    mimeType = mime,
+                    sizeBytes = size,
+                    addedAt = System.currentTimeMillis(),
+                    dateTakenAt = originalPhotoDate,
+                    photoDateResolved = isPhoto
+                )
+                val encryptedMetadata = crypto.encrypt(metadataJson(item))
+                try {
+                    FileOutputStream(metaTemp, false).use { metadataOutput ->
+                        metadataOutput.write(encryptedMetadata)
+                        metadataOutput.fd.sync()
+                    }
+                } finally {
+                    encryptedMetadata.fill(0)
                 }
+                verifyEncryptedMetadata(metaTemp, item)
+                commitNewVaultPair(dataTemp, metaTemp, dataTarget, metaTarget)
+                // Re-read the final object names after commit. The caller only attempts
+                // source erasure after this full verification has succeeded.
+                verifyEncryptedFile(dataTarget, size, expectedDigest)
+                verifyEncryptedMetadata(metaTarget, item)
+                return item
             } finally {
-                encryptedMetadata.fill(0)
+                expectedDigest.fill(0)
             }
-            check(dataTemp.renameTo(dataTarget)) { "Не удалось сохранить зашифрованный файл" }
-            check(metaTemp.renameTo(metaTarget)) { "Не удалось сохранить метаданные файла" }
-            return item
         } catch (error: Exception) {
             // A failed import may leave partial ciphertext. Remove it using the same
             // best-effort overwrite path as a normal vault deletion.
@@ -372,10 +401,16 @@ class FileVaultRepository(
     private fun exportVerified(item: VaultFile, destination: Uri) {
         val verifiedPlaintext = File.createTempFile("$cachePrefix-export-", ".tmp", context.cacheDir)
         try {
-            dataFile(item.id).inputStream().use { encryptedInput ->
+            val decryptedSize = dataFile(item.id).inputStream().use { encryptedInput ->
                 verifiedPlaintext.outputStream().use { temporaryOutput ->
                     crypto.decryptStream(encryptedInput, temporaryOutput)
                 }
+            }
+            check(decryptedSize == item.sizeBytes) {
+                "Размер файла не совпадает с зашифрованными метаданными. Экспорт отменён."
+            }
+            check(verifiedPlaintext.length() == item.sizeBytes) {
+                "Проверка размера временного файла не пройдена. Экспорт отменён."
             }
             val destinationOutput = context.contentResolver.openOutputStream(destination, "w")
                 ?: error("Не удалось создать файл для экспорта")
@@ -439,13 +474,89 @@ class FileVaultRepository(
     }
 
 
+    /**
+     * Re-read the committed-format ciphertext before any source document can be removed.
+     * Decrypted bytes are sent to a digest sink, never to a plaintext file.
+     */
+    private fun verifyEncryptedFile(file: File, expectedSize: Long, expectedDigest: ByteArray) {
+        check(file.isFile && file.length() > 0L) { "Зашифрованная копия файла не создана." }
+        val actualDigest = MessageDigest.getInstance("SHA-256")
+        val actualSize = file.inputStream().use { encryptedInput ->
+            crypto.decryptStream(encryptedInput, DigestOutputStream(DiscardOutputStream, actualDigest))
+        }
+        check(actualSize == expectedSize) { "Размер проверенной копии не совпадает с оригиналом." }
+        val digest = actualDigest.digest()
+        try {
+            check(MessageDigest.isEqual(digest, expectedDigest)) {
+                "Контрольная сумма зашифрованной копии не совпадает с оригиналом."
+            }
+        } finally {
+            digest.fill(0)
+        }
+    }
+
+    private fun verifyEncryptedMetadata(file: File, expected: VaultFile) {
+        val ciphertext = file.readBytes()
+        try {
+            val decoded = crypto.decryptToText(ciphertext)
+            check(decoded == metadataJson(expected)) { "Проверка зашифрованных метаданных не пройдена." }
+        } finally {
+            ciphertext.fill(0)
+        }
+    }
+
+    /** Targets have fresh UUIDs, so both final names must be unused before committing. */
+    private fun commitNewVaultPair(
+        dataTemp: File,
+        metadataTemp: File,
+        dataTarget: File,
+        metadataTarget: File
+    ) {
+        check(!dataTarget.exists() && !metadataTarget.exists()) { "Идентификатор файла уже существует." }
+        check(dataTemp.renameTo(dataTarget)) { "Не удалось зафиксировать зашифрованные данные." }
+        try {
+            check(metadataTemp.renameTo(metadataTarget)) { "Не удалось зафиксировать метаданные файла." }
+            syncVaultDirectory()
+        } catch (error: Exception) {
+            if (metadataTarget.exists() && !metadataTarget.delete()) {
+                error.addSuppressed(IllegalStateException("Не удалось удалить неполные метаданные файла."))
+            }
+            if (dataTarget.exists() && !dataTarget.delete()) {
+                error.addSuppressed(IllegalStateException("Не удалось удалить неполные зашифрованные данные."))
+            }
+            runCatching { syncVaultDirectory() }
+            throw error
+        }
+    }
+
+    private fun syncVaultDirectory() {
+        val directoryFd = Os.open(
+            root.absolutePath,
+            OsConstants.O_RDONLY or OsConstants.O_DIRECTORY,
+            0
+        )
+        try {
+            Os.fsync(directoryFd)
+        } finally {
+            Os.close(directoryFd)
+        }
+    }
+
+    private object DiscardOutputStream : OutputStream() {
+        override fun write(value: Int) = Unit
+        override fun write(buffer: ByteArray, offset: Int, length: Int) = Unit
+    }
+
     private fun readMetadata(id: String): VaultFile {
-        val json = JSONObject(crypto.decryptToText(metadataFile(id).readBytes()))
+        val metadata = metadataFile(id)
+        val json = JSONObject(crypto.decryptToText(AtomicFileIO.readBytes(metadata)))
+        val sizeBytes = json.optLong("sizeBytes", -1L)
+        require(sizeBytes >= 0L) { "В метаданных указан недопустимый размер файла." }
         return VaultFile(
             id = id,
             name = json.getString("name"),
             mimeType = json.optString("mimeType", "application/octet-stream"),
-            sizeBytes = json.optLong("sizeBytes", 0L),
+            sizeBytes = sizeBytes,
             addedAt = json.optLong("addedAt", 0L),
             dateTakenAt = if (json.has("dateTakenAt") && !json.isNull("dateTakenAt")) json.optLong("dateTakenAt") else null,
             photoDateResolved = json.optBoolean("photoDateResolved", json.has("dateTakenAt"))
@@ -532,23 +643,16 @@ class FileVaultRepository(
     }
 
     private fun writeMetadataAtomically(item: VaultFile) {
-        val target = metadataFile(item.id)
-        val temp = File(root, "${item.id}.meta.migrate.tmp")
         val encrypted = crypto.encrypt(metadataJson(item))
         try {
-            FileOutputStream(temp, false).use { output ->
-                output.write(encrypted)
-                output.fd.sync()
-            }
-            check(temp.renameTo(target)) { "Не удалось сохранить дату фотографии" }
+            AtomicFileIO.writeBytes(metadataFile(item.id), encrypted)
         } finally {
             encrypted.fill(0)
-            if (temp.exists()) overwriteAndDelete(temp)
         }
     }
 
     private fun overwriteAndDelete(file: File) {
-        if (!file.exists()) return
+        if (!AtomicFileIO.existsRecoverable(file) && !File(file.path + ".new").exists()) return
         runCatching {
             val originalLength = file.length()
             RandomAccessFile(file, "rw").use { stream ->
@@ -571,7 +675,7 @@ class FileVaultRepository(
                 stream.fd.sync()
             }
         }
-        file.delete()
+        check(AtomicFileIO.delete(file)) { "Не удалось удалить временный или зашифрованный файл: ${file.name}" }
     }
 
     private fun dataFile(id: String) = File(root, "$id.data.enc")
@@ -604,8 +708,14 @@ class FileVaultRepository(
         val files = root.listFiles().orEmpty()
         val dataIds = files.filter { it.name.endsWith(".data.enc") }
             .map { it.name.removeSuffix(".data.enc") }.toSet()
-        val metadataIds = files.filter { it.name.endsWith(".meta.enc") }
-            .map { it.name.removeSuffix(".meta.enc") }.toSet()
+        // A crash during AtomicFile metadata replacement can leave only .meta.enc.bak.
+        // Treat that recoverable previous record as present; otherwise cleanup could
+        // delete its still-valid encrypted data before AtomicFile gets a chance to recover.
+        val metadataIds = files.filter {
+            it.name.endsWith(".meta.enc") || it.name.endsWith(".meta.enc.bak")
+        }.map {
+            it.name.removeSuffix(".bak").removeSuffix(".meta.enc")
+        }.toSet()
         (dataIds - metadataIds).forEach { overwriteAndDelete(dataFile(it)) }
         (metadataIds - dataIds).forEach { overwriteAndDelete(metadataFile(it)) }
     }

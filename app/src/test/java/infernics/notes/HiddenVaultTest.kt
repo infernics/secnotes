@@ -73,6 +73,8 @@ class HiddenVaultTest {
             val hidden = java.io.File(files, HiddenVault.DIRECTORY_NAME).apply { mkdirs() }
             java.io.File(hidden, "secret.data.enc").writeBytes(byteArrayOf(1, 2, 3, 4))
             java.io.File(files, HiddenVault.METADATA_FILE_NAME).writeBytes(byteArrayOf(5, 6, 7))
+            java.io.File(files, "${HiddenVault.METADATA_FILE_NAME}.bak").writeBytes(byteArrayOf(7, 6, 5))
+            java.io.File(files, "${HiddenVault.METADATA_FILE_NAME}.new").writeBytes(byteArrayOf(4, 3, 2))
             java.io.File(files, "file_vault").apply { mkdirs() }
                 .resolve("primary.data.enc").writeBytes(byteArrayOf(8, 9))
             java.io.File(files, "notes").apply { mkdirs() }
@@ -85,6 +87,8 @@ class HiddenVaultTest {
 
             assertFalse(hidden.exists())
             assertFalse(java.io.File(files, HiddenVault.METADATA_FILE_NAME).exists())
+            assertFalse(java.io.File(files, "${HiddenVault.METADATA_FILE_NAME}.bak").exists())
+            assertFalse(java.io.File(files, "${HiddenVault.METADATA_FILE_NAME}.new").exists())
             assertFalse(java.io.File(cache, "media-thumbnail-secret.tmp").exists())
             assertTrue(java.io.File(files, "file_vault/primary.data.enc").isFile)
             assertTrue(java.io.File(files, "notes/primary-note.enc").isFile)
