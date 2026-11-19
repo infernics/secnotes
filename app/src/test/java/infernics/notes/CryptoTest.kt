@@ -9,6 +9,26 @@ import java.io.ByteArrayOutputStream
 
 class CryptoTest {
     @Test
+    fun passphrasesPreserveUnicodeAndLongInputWithoutTruncation() {
+        val salt = ByteArray(16) { (it + 1).toByte() }
+        val passphrase = "Пароль🔐" + "длинный".repeat(150)
+        val crypto = Crypto.fromPassphrase(passphrase, salt)
+        val encrypted = crypto.encrypt("unicode password check")
+        assertEquals("unicode password check", crypto.decryptToText(encrypted))
+        val different = Crypto.fromPassphrase(passphrase + "x", salt)
+        try {
+            different.decryptToText(encrypted)
+            fail("A changed long Unicode passphrase must not authenticate")
+        } catch (_: Exception) {
+            // Expected: the full passphrase participates in key derivation.
+        } finally {
+            crypto.destroy()
+            different.destroy()
+            salt.fill(0)
+        }
+    }
+
+    @Test
     fun encryptDecryptTextRoundTrip() {
         val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
         val encrypted = crypto.encrypt("SecNote private note")

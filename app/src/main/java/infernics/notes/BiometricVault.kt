@@ -37,6 +37,8 @@ object BiometricVault {
             prefs(context).contains(WRAPPED_KEY) && prefs(context).contains(IV)
 
     fun disable(context: Context) {
+        // Remove the persisted wrapper synchronously before deleting the Keystore key.
+        // If the process stops here, the wrapper is already unavailable to the app.
         prefs(context).edit().clear().commit()
         runCatching {
             val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -80,11 +82,17 @@ object BiometricVault {
                         } finally {
                             rawVaultKey.fill(0)
                         }
-                        prefs(activity).edit()
-                            .putString(WRAPPED_KEY, Base64.encodeToString(wrapped, Base64.NO_WRAP))
-                            .putString(IV, Base64.encodeToString(authorizedCipher.iv, Base64.NO_WRAP))
-                            .putBoolean(ENABLED, true)
-                            .apply()
+                        try {
+                            check(wrapped.size == 32 + 16) { "Некорректная длина биометрического ключа" }
+                            val saved = prefs(activity).edit()
+                                .putString(WRAPPED_KEY, Base64.encodeToString(wrapped, Base64.NO_WRAP))
+                                .putString(IV, Base64.encodeToString(authorizedCipher.iv, Base64.NO_WRAP))
+                                .putBoolean(ENABLED, true)
+                                .commit()
+                            check(saved) { "Не удалось надёжно сохранить биометрический ключ" }
+                        } finally {
+                            wrapped.fill(0)
+                        }
                         onEnabled()
                     } catch (error: Exception) {
                         disable(activity)
@@ -119,12 +127,18 @@ object BiometricVault {
         }
         val stored = prefs(activity)
         val wrapped = runCatching {
-            Base64.decode(stored.getString(WRAPPED_KEY, null), Base64.NO_WRAP)
+            val encoded = stored.getString(WRAPPED_KEY, null) ?: return@runCatching null
+            if (encoded.length > 256) return@runCatching null
+            Base64.decode(encoded, Base64.NO_WRAP)
         }.getOrNull()
         val iv = runCatching {
-            Base64.decode(stored.getString(IV, null), Base64.NO_WRAP)
+            val encoded = stored.getString(IV, null) ?: return@runCatching null
+            if (encoded.length > 64) return@runCatching null
+            Base64.decode(encoded, Base64.NO_WRAP)
         }.getOrNull()
-        if (wrapped == null || iv == null || iv.size != 12) {
+        if (wrapped == null || wrapped.size != 48 || iv == null || iv.size != 12) {
+            wrapped?.fill(0)
+            iv?.fill(0)
             disable(activity)
             onError("Биометрический ключ повреждён. Войдите по паролю и включите биометрию заново.")
             return
@@ -133,10 +147,14 @@ object BiometricVault {
         val cipher = try {
             createDecryptionCipher(iv)
         } catch (_: KeyPermanentlyInvalidatedException) {
+            wrapped.fill(0)
+            iv.fill(0)
             disable(activity)
             onError("Отпечатки изменились. Войдите по основному паролю и включите биометрию заново.")
             return
         } catch (error: Exception) {
+            wrapped.fill(0)
+            iv.fill(0)
             disable(activity)
             onError("Биометрический ключ недоступен. Войдите по паролю и настройте биометрию заново.")
             return
@@ -162,12 +180,17 @@ object BiometricVault {
                     } catch (error: Exception) {
                         disable(activity)
                         onError("Не удалось открыть биометрический ключ. Войдите по паролю.")
+                    } finally {
+                        wrapped.fill(0)
+                        iv.fill(0)
                     }
                 }
 
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
                     super.onAuthenticationError(errorCode, errString)
                     activity.allowTemporarySystemUi = false
+                    wrapped.fill(0)
+                    iv.fill(0)
                     onError(errString.toString())
                 }
             }
@@ -177,6 +200,8 @@ object BiometricVault {
             prompt.authenticate(promptInfo("Вход в SecNote", "Подтвердите личность для разблокировки"), BiometricPrompt.CryptoObject(cipher))
         } catch (error: Exception) {
             activity.allowTemporarySystemUi = false
+            wrapped.fill(0)
+            iv.fill(0)
             onError("Не удалось открыть системную биометрию: ${error.message ?: "ошибка"}")
         }
     }

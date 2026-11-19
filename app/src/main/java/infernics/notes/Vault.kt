@@ -25,7 +25,9 @@ import javax.crypto.spec.GCMParameterSpec
  */
 object Vault {
     private const val SALT_KEY_ALIAS = "SecNoteVaultSaltKey"
-    private const val SALT_MAGIC = 0x53434B31 // SCK1
+    private const val LEGACY_SALT_MAGIC = 0x53434B31 // SCK1: authenticated by GCM tag only
+    private const val SALT_MAGIC = 0x53434B32 // SCK2: purpose-bound with AAD
+    private val SALT_AAD = "SecNote/Keystore/salt/v2".toByteArray(Charsets.UTF_8)
     private const val SALT_LENGTH = 16
     private const val GCM_IV_LENGTH = 12
     private const val TAG_BITS = 128
@@ -118,8 +120,9 @@ object Vault {
 
             val storedBytes = AtomicFileIO.readBytes(salt)
             storedSalt = storedBytes
-            val isLegacySalt = storedBytes.size == SALT_LENGTH
-            val saltBytes = if (isLegacySalt) storedBytes.copyOf() else unwrapSalt(storedBytes)
+            val isRawLegacySalt = storedBytes.size == SALT_LENGTH
+            val needsRewrap = isRawLegacySalt || isLegacyWrappedSalt(storedBytes)
+            val saltBytes = if (isRawLegacySalt) storedBytes.copyOf() else unwrapSalt(storedBytes)
             recoveredSalt = saltBytes
             if (saltBytes.size != SALT_LENGTH) return false
 
@@ -127,7 +130,7 @@ object Vault {
             checkBlob = checkBytes
             if (crypto.decryptToText(checkBytes) != "verify") return false
 
-            if (isLegacySalt) {
+            if (needsRewrap) {
                 val wrappedBytes = wrapSalt(saltBytes)
                 wrapped = wrappedBytes
                 writeAtomically(salt, wrappedBytes)
@@ -212,6 +215,7 @@ object Vault {
         require(salt.size == SALT_LENGTH)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSaltWrappingKey())
+        cipher.updateAAD(SALT_AAD)
         val encrypted = cipher.doFinal(salt)
         return try {
             ByteBuffer.allocate(4 + GCM_IV_LENGTH + encrypted.size)
@@ -227,7 +231,8 @@ object Vault {
     private fun unwrapSalt(blob: ByteArray): ByteArray {
         require(blob.size >= 4 + GCM_IV_LENGTH + 16) { "Повреждён ключевой материал" }
         val buffer = ByteBuffer.wrap(blob)
-        require(buffer.int == SALT_MAGIC) { "Неизвестный формат ключевого материала" }
+        val magic = buffer.int
+        require(magic == SALT_MAGIC || magic == LEGACY_SALT_MAGIC) { "Неизвестный формат ключевого материала" }
         val iv = ByteArray(GCM_IV_LENGTH).also { buffer.get(it) }
         val encrypted = ByteArray(buffer.remaining()).also { buffer.get(it) }
         return try {
@@ -236,12 +241,18 @@ object Vault {
                 ?: error("Ключ хранилища Android недоступен")
             Cipher.getInstance("AES/GCM/NoPadding").run {
                 init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_BITS, iv))
+                if (magic == SALT_MAGIC) updateAAD(SALT_AAD)
                 doFinal(encrypted)
             }
         } finally {
             iv.fill(0)
             encrypted.fill(0)
         }
+    }
+
+    private fun isLegacyWrappedSalt(blob: ByteArray): Boolean {
+        if (blob.size < 4) return false
+        return runCatching { ByteBuffer.wrap(blob).int == LEGACY_SALT_MAGIC }.getOrDefault(false)
     }
 
     private fun getOrCreateSaltWrappingKey(): SecretKey {
