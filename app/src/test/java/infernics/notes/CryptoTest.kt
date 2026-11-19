@@ -196,4 +196,53 @@ class CryptoTest {
         legacy.fill(0)
     }
 
+    @Test
+    fun contextualFileStreamCannotBeMovedBetweenObjects() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val original = ByteArray(150_000) { (it % 241).toByte() }
+        val firstContext = Crypto.contextAad("file-data", "file-one")
+        val secondContext = Crypto.contextAad("file-data", "file-two")
+        val otherDomain = Crypto.contextAad("file-metadata", "file-one")
+        val encrypted = ByteArrayOutputStream()
+        crypto.encryptStream(ByteArrayInputStream(original), encrypted, firstContext)
+
+        val restored = ByteArrayOutputStream()
+        crypto.decryptStream(ByteArrayInputStream(encrypted.toByteArray()), restored, firstContext)
+        assertArrayEquals(original, restored.toByteArray())
+        listOf(secondContext, otherDomain).forEach { wrongContext ->
+            try {
+                crypto.decryptStream(ByteArrayInputStream(encrypted.toByteArray()), ByteArrayOutputStream(), wrongContext)
+                fail("A context-bound file stream must reject another ID or domain")
+            } catch (_: Exception) {
+                // Expected: GCM authentication rejects cross-object substitution.
+            }
+        }
+        try {
+            crypto.decryptStream(ByteArrayInputStream(encrypted.toByteArray()), ByteArrayOutputStream())
+            fail("SNF2 must require its object context")
+        } catch (_: Exception) {
+            // Expected: no-context API cannot open context-bound vault files.
+        } finally {
+            original.fill(0)
+            firstContext.fill(0)
+            secondContext.fill(0)
+            otherDomain.fill(0)
+            encrypted.toByteArray().fill(0)
+        }
+    }
+
+    @Test
+    fun legacyFileStreamRemainsReadableThroughContextAwareApi() {
+        val crypto = Crypto.fromPassphrase("correct horse battery", Crypto.newSalt())
+        val original = ByteArray(90_000) { (it % 233).toByte() }
+        val legacy = ByteArrayOutputStream()
+        crypto.encryptStream(ByteArrayInputStream(original), legacy)
+        val context = Crypto.contextAad("file-data", "legacy-file")
+        val restored = ByteArrayOutputStream()
+        crypto.decryptStream(ByteArrayInputStream(legacy.toByteArray()), restored, context)
+        assertArrayEquals(original, restored.toByteArray())
+        context.fill(0)
+        original.fill(0)
+    }
+
 }

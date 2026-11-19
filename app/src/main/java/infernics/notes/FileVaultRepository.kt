@@ -151,14 +151,14 @@ class FileVaultRepository(
                     val plaintextSize = ByteArrayInputStream(jpegBytes).use { source ->
                         val digestedSource = DigestInputStream(source, sourceDigest)
                         FileOutputStream(dataTemp, false).use { encryptedOutput ->
-                            crypto.encryptStream(digestedSource, encryptedOutput).also {
+                            crypto.encryptStream(digestedSource, encryptedOutput, Crypto.contextAad("file-data", id)).also {
                                 encryptedOutput.fd.sync()
                             }
                         }
                     }
                     val expectedDigest = sourceDigest.digest()
                     try {
-                        verifyEncryptedFile(dataTemp, plaintextSize, expectedDigest)
+                        verifyEncryptedFile(dataTemp, item.id, plaintextSize, expectedDigest)
                         val encryptedMetadata = crypto.encrypt(metadataJson(item), Crypto.contextAad("file-metadata", item.id))
                         try {
                             FileOutputStream(metaTemp, false).use { metadataOutput ->
@@ -172,7 +172,7 @@ class FileVaultRepository(
                         commitNewVaultPair(dataTemp, metaTemp, dataTarget, metaTarget)
                         // Verify the committed names after rename/fsync, before the camera
                         // buffer can be treated as safely stored.
-                        verifyEncryptedFile(dataTarget, plaintextSize, expectedDigest)
+                        verifyEncryptedFile(dataTarget, item.id, plaintextSize, expectedDigest)
                         verifyEncryptedMetadata(metaTarget, item)
                         item
                     } finally {
@@ -243,14 +243,14 @@ class FileVaultRepository(
             val size = input.use { source ->
                 val digestedSource = DigestInputStream(source, sourceDigest)
                 FileOutputStream(dataTemp, false).use { encryptedOutput ->
-                    crypto.encryptStream(digestedSource, encryptedOutput).also {
+                    crypto.encryptStream(digestedSource, encryptedOutput, Crypto.contextAad("file-data", id)).also {
                         encryptedOutput.fd.sync()
                     }
                 }
             }
             val expectedDigest = sourceDigest.digest()
             try {
-                verifyEncryptedFile(dataTemp, size, expectedDigest)
+                verifyEncryptedFile(dataTemp, id, size, expectedDigest)
                 val item = VaultFile(
                     id = id,
                     name = name,
@@ -273,7 +273,7 @@ class FileVaultRepository(
                 commitNewVaultPair(dataTemp, metaTemp, dataTarget, metaTarget)
                 // Re-read the final object names after commit. The caller only attempts
                 // source erasure after this full verification has succeeded.
-                verifyEncryptedFile(dataTarget, size, expectedDigest)
+                verifyEncryptedFile(dataTarget, id, size, expectedDigest)
                 verifyEncryptedMetadata(metaTarget, item)
                 return item
             } finally {
@@ -403,7 +403,7 @@ class FileVaultRepository(
         try {
             val decryptedSize = dataFile(item.id).inputStream().use { encryptedInput ->
                 verifiedPlaintext.outputStream().use { temporaryOutput ->
-                    crypto.decryptStream(encryptedInput, temporaryOutput)
+                    crypto.decryptStream(encryptedInput, temporaryOutput, Crypto.contextAad("file-data", item.id))
                 }
             }
             check(decryptedSize == item.sizeBytes) {
@@ -441,7 +441,7 @@ class FileVaultRepository(
             temporaryPlaintext = tempFile
             encryptedFile.inputStream().use { encryptedInput ->
                 tempFile.outputStream().use { output ->
-                    crypto.decryptStream(encryptedInput, output)
+                    crypto.decryptStream(encryptedInput, output, Crypto.contextAad("file-data", id))
                 }
             }
             val bounds = BitmapFactory.Options().apply {
@@ -478,11 +478,11 @@ class FileVaultRepository(
      * Re-read the committed-format ciphertext before any source document can be removed.
      * Decrypted bytes are sent to a digest sink, never to a plaintext file.
      */
-    private fun verifyEncryptedFile(file: File, expectedSize: Long, expectedDigest: ByteArray) {
+    private fun verifyEncryptedFile(file: File, id: String, expectedSize: Long, expectedDigest: ByteArray) {
         check(file.isFile && file.length() > 0L) { "Зашифрованная копия файла не создана." }
         val actualDigest = MessageDigest.getInstance("SHA-256")
         val actualSize = file.inputStream().use { encryptedInput ->
-            crypto.decryptStream(encryptedInput, DigestOutputStream(DiscardOutputStream, actualDigest))
+            crypto.decryptStream(encryptedInput, DigestOutputStream(DiscardOutputStream, actualDigest), Crypto.contextAad("file-data", id))
         }
         check(actualSize == expectedSize) { "Размер проверенной копии не совпадает с оригиналом." }
         val digest = actualDigest.digest()
@@ -632,7 +632,7 @@ class FileVaultRepository(
             val tempFile = File.createTempFile("$cachePrefix-date-", ".tmp", context.cacheDir)
             plaintext = tempFile
             dataFile(item.id).inputStream().use { encryptedInput ->
-                tempFile.outputStream().use { output -> crypto.decryptStream(encryptedInput, output) }
+                tempFile.outputStream().use { output -> crypto.decryptStream(encryptedInput, output, Crypto.contextAad("file-data", item.id)) }
             }
             val dateTaken = runCatching {
                 val exif = ExifInterface(tempFile.absolutePath)

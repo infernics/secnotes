@@ -667,7 +667,7 @@ internal object BackupManager {
                 }
                 val dataFile = File(payload, "file_vault/$id.data.enc")
                 require(dataFile.isFile) { "Не найдены данные файла $id." }
-                val size = crypto.decryptStream(dataFile.inputStream(), NullOutputStream)
+                val size = crypto.decryptStream(dataFile.inputStream(), NullOutputStream, Crypto.contextAad("file-data", id))
                 require(size == meta.optLong("sizeBytes", -1L)) { "Размер файла $id не совпадает с метаданными." }
             }
             val panic = File(payload, "security/panic.credential")

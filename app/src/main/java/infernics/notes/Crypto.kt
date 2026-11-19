@@ -119,9 +119,17 @@ class Crypto private constructor(rawKey: ByteArray) {
      * authenticated index/length; an encrypted footer authenticates the total size
      * and chunk count. This keeps memory bounded and detects truncation/reordering.
      */
-    fun encryptStream(input: InputStream, output: OutputStream): Long {
+    fun encryptStream(input: InputStream, output: OutputStream): Long =
+        encryptStreamInternal(input, output, null)
+
+    /** New vault-file format binds every chunk and the footer to the file's logical ID. */
+    fun encryptStream(input: InputStream, output: OutputStream, aad: ByteArray): Long =
+        encryptStreamInternal(input, output, aad)
+
+    private fun encryptStreamInternal(input: InputStream, output: OutputStream, aad: ByteArray?): Long {
+        val magic = if (aad == null) FILE_MAGIC else FILE_CONTEXT_MAGIC
         val data = DataOutputStream(output)
-        data.write(FILE_MAGIC)
+        data.write(magic)
         val buffer = ByteArray(FILE_CHUNK_SIZE)
         var chunkIndex = 0
         var totalBytes = 0L
@@ -141,7 +149,7 @@ class Crypto private constructor(rawKey: ByteArray) {
 
                 val iv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
                 val cipher = fileCipher(Cipher.ENCRYPT_MODE, iv).apply {
-                    updateAAD(chunkAad(chunkIndex, count))
+                    updateAAD(streamChunkAad(magic, aad, chunkIndex, count))
                 }
                 val encrypted = cipher.doFinal(buffer, 0, count)
                 try {
@@ -159,7 +167,7 @@ class Crypto private constructor(rawKey: ByteArray) {
             val footer = ByteBuffer.allocate(12).putInt(chunkIndex).putLong(totalBytes).array()
             val footerIv = ByteArray(IV_LEN).also(SECURE_RANDOM::nextBytes)
             val footerCipher = fileCipher(Cipher.ENCRYPT_MODE, footerIv).apply {
-                updateAAD(footerAad(chunkIndex))
+                updateAAD(streamFooterAad(magic, aad, chunkIndex))
             }
             val encryptedFooter = footerCipher.doFinal(footer)
             try {
@@ -179,11 +187,21 @@ class Crypto private constructor(rawKey: ByteArray) {
     }
 
     /** Each chunk is authenticated before its plaintext is written to the private temp file. */
-    fun decryptStream(input: InputStream, output: OutputStream): Long {
+    fun decryptStream(input: InputStream, output: OutputStream): Long =
+        decryptStreamInternal(input, output, null)
+
+    /** Reads SNF2 with its required object context and SNF1 for backwards compatibility. */
+    fun decryptStream(input: InputStream, output: OutputStream, aad: ByteArray): Long =
+        decryptStreamInternal(input, output, aad)
+
+    private fun decryptStreamInternal(input: InputStream, output: OutputStream, aad: ByteArray?): Long {
         val data = DataInputStream(input)
         val magic = ByteArray(FILE_MAGIC.size)
         data.readFully(magic)
-        require(magic.contentEquals(FILE_MAGIC)) { "Unknown encrypted file format" }
+        val contextual = magic.contentEquals(FILE_CONTEXT_MAGIC)
+        require(contextual || magic.contentEquals(FILE_MAGIC)) { "Unknown encrypted file format" }
+        require(!contextual || aad != null) { "Encrypted file requires its object context" }
+        val effectiveAad = if (contextual) aad else null
 
         var chunkIndex = 0
         var totalBytes = 0L
@@ -200,7 +218,7 @@ class Crypto private constructor(rawKey: ByteArray) {
                 var footerBytes: ByteArray? = null
                 try {
                     val footerCipher = fileCipher(Cipher.DECRYPT_MODE, iv).apply {
-                        updateAAD(footerAad(chunkIndex))
+                        updateAAD(streamFooterAad(magic, effectiveAad, chunkIndex))
                     }
                     footerBytes = footerCipher.doFinal(encrypted)
                     val footer = ByteBuffer.wrap(footerBytes)
@@ -220,7 +238,7 @@ class Crypto private constructor(rawKey: ByteArray) {
             }
 
             val cipher = fileCipher(Cipher.DECRYPT_MODE, iv).apply {
-                updateAAD(chunkAad(chunkIndex, plainLength))
+                updateAAD(streamChunkAad(magic, effectiveAad, chunkIndex, plainLength))
             }
             val plain = cipher.doFinal(encrypted)
             try {
@@ -241,11 +259,15 @@ class Crypto private constructor(rawKey: ByteArray) {
             init(mode, key, GCMParameterSpec(TAG_BITS, iv))
         }
 
-    private fun chunkAad(index: Int, length: Int): ByteArray =
-        FILE_MAGIC + ByteBuffer.allocate(8).putInt(index).putInt(length).array()
+    private fun streamChunkAad(magic: ByteArray, context: ByteArray?, index: Int, length: Int): ByteArray {
+        val suffix = ByteBuffer.allocate(8).putInt(index).putInt(length).array()
+        return if (context == null) magic + suffix else magic + context + suffix
+    }
 
-    private fun footerAad(chunkCount: Int): ByteArray =
-        FILE_MAGIC + byteArrayOf(0x45, 0x4E, 0x44) + ByteBuffer.allocate(4).putInt(chunkCount).array()
+    private fun streamFooterAad(magic: ByteArray, context: ByteArray?, chunkCount: Int): ByteArray {
+        val suffix = byteArrayOf(0x45, 0x4E, 0x44) + ByteBuffer.allocate(4).putInt(chunkCount).array()
+        return if (context == null) magic + suffix else magic + context + suffix
+    }
 
     /** Used only to wrap the existing vault key inside Android Keystore after explicit opt-in. */
     internal fun exportKeyForBiometricWrapping(): ByteArray {
@@ -288,7 +310,8 @@ class Crypto private constructor(rawKey: ByteArray) {
         private const val TAG_BITS = 128
         private const val TAG_LEN_BYTES = TAG_BITS / 8
         private const val FILE_CHUNK_SIZE = 64 * 1024
-        private val FILE_MAGIC = byteArrayOf(0x53, 0x4E, 0x46, 0x31) // SNF1
+        private val FILE_MAGIC = byteArrayOf(0x53, 0x4E, 0x46, 0x31) // SNF1: portable backups + legacy vault files
+        private val FILE_CONTEXT_MAGIC = byteArrayOf(0x53, 0x4E, 0x46, 0x32) // SNF2: context-bound vault files
 
         fun newSalt(): ByteArray = ByteArray(SALT_LEN).also(SECURE_RANDOM::nextBytes)
 
